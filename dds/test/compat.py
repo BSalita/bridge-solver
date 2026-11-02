@@ -119,6 +119,9 @@ def load(path: Path, name: str, copy: bool):
                                        C.POINTER(SolvedPlays), C.c_int]
     lib.ErrorMessage.argtypes = [C.c_int, C.c_char_p]
     lib.SetMaxThreads.argtypes = [C.c_int]
+    # As DDS callers do first (mlBridge too): ddss on Linux has no thread
+    # memory until SetMaxThreads, and SolveBoard would exit.
+    lib.SetMaxThreads(0)
     return lib
 
 
