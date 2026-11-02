@@ -31,6 +31,11 @@
 #include "include/dll.h"
 #include "vendor/PBN.h"
 
+// The source revision, set by build.sh; shown by GetDDSInfo.
+#ifndef BS_VERSION
+#define BS_VERSION "unknown"
+#endif
+
 // The tables the vendored ddss code reads (ddss src/Init.cpp).
 unsigned short int bitMapRank[16] = {0x0000, 0x0000, 0x0001, 0x0002, 0x0004, 0x0008,
                                      0x0010, 0x0020, 0x0040, 0x0080, 0x0100, 0x0200,
@@ -781,11 +786,13 @@ EXTERN_C DLLEXPORT void STDCALL GetDDSInfo(struct DDSInfo* info) {
   info->threading = 5;  // STL
   info->noOfThreads = Threads();
   snprintf(info->threadSizes, sizeof info->threadSizes, "%d threads", info->noOfThreads);
+  // The first line names the engine; callers such as mlBridge read it to tell
+  // this library from ddss, whose version fields these match.
   snprintf(info->systemString, sizeof info->systemString,
-           "bridge-solver-cpp with DDS 2.9's API (ddss-compatible)\n"
-           "Engine: macroxue/bridge-solver, BSalita fork\n"
+           "bridge-solver-cpp dds-api %s\n"
+           "DDS 2.9 API, ddss-compatible; engine macroxue/bridge-solver (BSalita fork)\n"
            "Cores: %d, threads: %d\n",
-           info->numCores, info->noOfThreads);
+           BS_VERSION, info->numCores, info->noOfThreads);
 }
 
 EXTERN_C DLLEXPORT void STDCALL ErrorMessage(int code, char line[80]) {

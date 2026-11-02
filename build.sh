@@ -2,7 +2,8 @@
 #
 # Build the solver library and the programs built on it, with PGO:
 #
-#   ./build.sh
+#   ./build.sh                     for this machine (-march=native)
+#   MARCH=x86-64-v3 ./build.sh     for others too, as a deploy build must
 #
 #   solver(.exe) + bsolver.dll / libbsolver.so   the command line and the
 #                                                library it calls, here at the
@@ -50,8 +51,14 @@ if [ $SYS = windows ] && [ -n "$IS_GCC" ]; then
 fi
 
 OPTS=(-std=c++17 -O3 -fno-stack-protector -DNDEBUG -Wall -I.)
-# -march=native is unsafe on AArch64 (see the makefile); NEON is baseline there.
-echo | "$CXX" -E -dM -x c++ - 2>/dev/null | grep -q __aarch64__ || OPTS+=(-march=native)
+if [ -n "${MARCH:-}" ]; then
+  OPTS+=(-march="$MARCH")
+else
+  # -march=native is unsafe on AArch64 (see the makefile); NEON is baseline there.
+  echo | "$CXX" -E -dM -x c++ - 2>/dev/null | grep -q __aarch64__ || OPTS+=(-march=native)
+fi
+# The revision GetDDSInfo reports (dds/dds-api.cc).
+OPTS+=("-DBS_VERSION=\"$(git describe --always --dirty 2>/dev/null || echo unknown)\"")
 case $SYS in
   windows) OPTS+=(-D_CRT_SECURE_NO_WARNINGS "-DS_ISCHR(m)=(((m)&_S_IFMT)==_S_IFCHR)")
            CORE_LIB=bsolver.dll; DDS_LIB=dds.dll; SINGLE_LIB=dds-single.dll ;;
