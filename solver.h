@@ -1,12 +1,33 @@
-// The public API of the double-dummy solver in solver.cc, used by the command
-// line in solver-cli.cc and the web app in web/web-bindings.cc. Everything
-// else in solver.cc is internal.
+// The public API of the double-dummy solver in solver.cc and pool.cc: the
+// native calls of the solver library (bsolver.dll / libbsolver.so), used by
+// the command line in solver-cli.cc, the DDS-compatible library in dds/, and
+// the web app in web/web-bindings.cc. Everything else in solver.cc is internal.
+//
+// It is a C++ API: the library and the programs using it must be built with
+// the same compiler and C++ runtime (clang on Windows; g++ or clang elsewhere).
 #ifndef SOLVER_H
 #define SOLVER_H
 
 #include <functional>
 #include <string>
 #include <vector>
+
+// BS_API marks what the library exports. Building the library defines
+// BS_BUILDING_LIBRARY, and a program linking to it defines BS_USING_LIBRARY
+// (both matter only on Windows). A program compiled together with the solver's
+// sources (the web app, debug builds, the single-file DDS library, anything
+// that compiled solver.cc before there was a library) defines neither.
+#if defined(BS_BUILDING_LIBRARY)
+#ifdef _WIN32
+#define BS_API __declspec(dllexport)
+#else
+#define BS_API __attribute__((visibility("default")))
+#endif
+#elif defined(BS_USING_LIBRARY) && defined(_WIN32)
+#define BS_API __declspec(dllimport)
+#else
+#define BS_API
+#endif
 
 enum { SPADE, HEART, DIAMOND, CLUB, NUM_SUITS, NOTRUMP = NUM_SUITS };
 enum { TWO, TEN = 8, JACK, QUEEN, KING, ACE, NUM_RANKS };
@@ -21,24 +42,24 @@ struct Options {
   int stats_level = 0;               // Show search and cache statistics after each search.
   bool discard_suit_bottom = false;  // Discard only a suit's lowest card: faster, imprecise.
 };
-extern Options options;
+extern BS_API Options options;
 
-const char* SeatName(int seat);
-const char* SuitName(int suit);
-const char* SuitSign(int suit);  // Colored when stdout is a terminal.
-char RankName(int rank);
-bool IsNs(int seat);
+BS_API const char* SeatName(int seat);
+BS_API const char* SuitName(int suit);
+BS_API const char* SuitSign(int suit);  // Colored when stdout is a terminal.
+BS_API char RankName(int rank);
+BS_API bool IsNs(int seat);
 
 // These exit on an unknown character.
-int CharToSuit(char c);
-int CharToRank(char c);
-int CharToSeat(char c);
+BS_API int CharToSuit(char c);
+BS_API int CharToRank(char c);
+BS_API int CharToSeat(char c);
 
 // A card is an int; only these functions look inside it.
-int CardOf(int suit, int rank);
-int SuitOf(int card);
-int RankOf(int card);
-const char* NameOf(int card);  // Suit letter and rank, e.g. "SA".
+BS_API int CardOf(int suit, int rank);
+BS_API int SuitOf(int card);
+BS_API int RankOf(int card);
+BS_API const char* NameOf(int card);  // Suit letter and rank, e.g. "SA".
 
 // A deal or an ending, as each seat's cards from spades to clubs, with suits
 // separated by spaces and '-' for a void, e.g. "AK2 QJT9 - 8765432". Other
@@ -50,22 +71,22 @@ struct Deal {
 // Checks a deal typed by a user and writes it in the form above. An 'x' is the
 // lowest card of its suit not given out yet, going W, N, E, S, and hands left
 // empty get the remaining cards at random. Exits on an invalid deal.
-Deal ParseDeal(const Deal& deal);
-Deal RandomDeal();
+BS_API Deal ParseDeal(const Deal& deal);
+BS_API Deal RandomDeal();
 // Deals the cards of `seats`, e.g. "WE", among them again at random.
-Deal ShuffleDeal(const Deal& deal, const char* seats);
+BS_API Deal ShuffleDeal(const Deal& deal, const char* seats);
 // A full deal's unique code and back.
-std::string EncodeDeal(const Deal& deal);
-Deal DecodeDeal(const char* code);
+BS_API std::string EncodeDeal(const Deal& deal);
+BS_API Deal DecodeDeal(const char* code);
 
-int NumTricks(const Deal& deal);
-void ShowCompact(const Deal& deal, int rotation = 0);
+BS_API int NumTricks(const Deal& deal);
+BS_API void ShowCompact(const Deal& deal, int rotation = 0);
 // Also shows each hand's high-card points.
-void ShowDetailed(const Deal& deal, int rotation = 0);
+BS_API void ShowDetailed(const Deal& deal, int rotation = 0);
 
 // Solves a deal for each trump and then each lead seat, giving the N/S tricks
 // to `seat_done`.
-void Solve(const Deal& deal, const std::vector<int>& trumps, const std::vector<int>& lead_seats,
+BS_API void Solve(const Deal& deal, const std::vector<int>& trumps, const std::vector<int>& lead_seats,
            const std::function<void(int trump)>& trump_start,
            const std::function<void(int trump, int lead_seat, int ns_tricks)>& seat_done,
            const std::function<void(int trump)>& trump_done);
@@ -78,7 +99,7 @@ struct Position {
   // The cards seat_to_play may play, one of each group of equivalent cards.
   std::vector<int> playable_cards;
 };
-Position GetPosition(const Deal& deal, int trump, int lead_seat,
+BS_API Position GetPosition(const Deal& deal, int trump, int lead_seat,
                      const std::vector<int>& played_cards);
 
 // The N/S tricks at the end of the deal when both sides play their best after
@@ -86,7 +107,55 @@ Position GetPosition(const Deal& deal, int trump, int lead_seat,
 // `guess_ns_tricks`, or at a guess from the hands when it is -1. Searches by
 // Solve() and SolvePlay() share their caches while the deal and trump stay the
 // same.
-int SolvePlay(const Deal& deal, int trump, int lead_seat, const std::vector<int>& played_cards,
+BS_API int SolvePlay(const Deal& deal, int trump, int lead_seat, const std::vector<int>& played_cards,
               int guess_ns_tricks = -1);
+
+// SolvePlay() for each of `cards`, each played by the seat to play after
+// `played_cards` (which may be empty): the N/S tricks at the end of the deal.
+// Each search starts at `guess_ns_tricks` (-1 guesses from the hands) or, after
+// the first, at the previous card's answer. The cards must be legal there.
+BS_API std::vector<int> SolvePlays(const Deal& deal, int trump, int lead_seat,
+                            const std::vector<int>& played_cards, const std::vector<int>& cards,
+                            int guess_ns_tricks = -1);
+
+// Whether N/S take at least `ns_tricks` tricks in the deal when `card` is
+// played after `played_cards` and both sides play their best: one null-window
+// test, cheaper than finding the exact count.
+BS_API bool SolvePlayAtLeast(const Deal& deal, int trump, int lead_seat,
+                      const std::vector<int>& played_cards, int card, int ns_tricks);
+
+// Frees the calling thread's search caches; the next search makes new ones.
+// The caches are per thread, so a library can run searches on many threads.
+BS_API void ReleaseCaches();
+
+// Every card the seat to play after `played_cards` may play, not just one of
+// each group of equivalent cards.
+BS_API std::vector<int> LegalCards(const Deal& deal, int trump, int lead_seat,
+                            const std::vector<int>& played_cards);
+
+// ---- Many searches at once (pool.cc) ----
+
+// The library keeps a pool of threads that live as long as it does, or until
+// SetThreads() changes their number. Each keeps its search caches between
+// calls, which is how the solver runs best.
+BS_API int Cores();
+BS_API void SetThreads(int threads);  // 0: one per core
+BS_API int Threads();
+
+// Runs work(i) for each i in [0, n) on the pool, each i on one thread, and
+// returns when all are done; on the calling thread when there is one thread
+// or one item. Calls to it don't overlap: a second waits for the first.
+BS_API void ForEach(int n, const std::function<void(int i)>& work);
+
+// Solve() for many deals across the pool: every (deal, trump) pair in turn,
+// the hardest-looking deals first (DDS's fanout order), each trump solved for
+// the lead seats W, E, N, S. `seat_done` runs on pool threads, one call per
+// deal, trump and lead seat.
+BS_API void SolveTables(
+    const std::vector<Deal>& deals, const std::vector<int>& trumps,
+    const std::function<void(int deal, int trump, int lead_seat, int ns_tricks)>& seat_done);
+
+// ReleaseCaches() on the calling thread and on every pool thread.
+BS_API void ReleaseAllCaches();
 
 #endif  // SOLVER_H

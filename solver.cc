@@ -342,7 +342,7 @@ class Hands {
 
   void Deal(Cards cards, const std::vector<int>& seats) {
     // Seed with multiple random_device draws as each one is only 32-bit.
-    static std::mt19937 random = [] {
+    static thread_local std::mt19937 random = [] {
       std::random_device rd;
       std::seed_seq seed{rd(), rd(), rd(), rd()};
       return std::mt19937(seed);
@@ -536,13 +536,28 @@ class Cache {
   // The hash is stored in Entry and can vary in size.
   using HashT = decltype(Entry::hash);
 
-  Cache(const char* name, int bits)
-      : cache_name(name), bits(bits), size(1 << bits), entries(new Entry[size]) {
+  constexpr Cache(const char* name, int bits)
+      : cache_name(name), initial_bits(bits), bits(bits), size(1 << bits) {}
+
+  // Allocates the table on a thread's first search.
+  void Ensure() {
+    if (entries) return;
+    entries = new Entry[size];
     Reset();
+  }
+
+  // Frees the table, back to its initial size; Ensure() makes a new one.
+  void Release() {
+    delete[] entries;
+    entries = nullptr;
+    bits = initial_bits;
+    size = 1 << bits;
+    load_count = 0;
   }
 
   void Reset() {
     load_count = lookups = lookup_probes = hits = updates = update_probes = overwrites = 0;
+    if (!entries) return;
     for (int i = 0; i < size; ++i) entries[i].Reset(0);
   }
 
@@ -610,13 +625,13 @@ class Cache {
 
  private:
   void Resize() {
-    auto old_entries = std::move(entries);
+    Entry* old_entries = entries;
     int old_size = size;
 
     // Double cache size.
     size = 1 << ++bits;
-    entries.reset(new Entry[size]);
-    CHECK(entries.get());
+    entries = new Entry[size];
+    CHECK(entries);
     for (int i = 0; i < size; ++i) entries[i].hash = 0;
 
     // Move entries in the old cache to the new cache.
@@ -634,16 +649,18 @@ class Cache {
         }
       }
     }
+    delete[] old_entries;
   }
 
   const char* cache_name;
+  int initial_bits;
   int bits;
   int size;
-  std::unique_ptr<Entry[]> entries;
+  Entry* entries = nullptr;  // freed by Release(), else lives as long as its thread
 
-  mutable int load_count;
-  mutable int lookups, lookup_probes, hits;
-  mutable int updates, update_probes, overwrites;
+  mutable int load_count = 0;
+  mutable int lookups = 0, lookup_probes = 0, hits = 0;
+  mutable int updates = 0, update_probes = 0, overwrites = 0;
 };
 
 #pragma pack(push, 4)
@@ -741,9 +758,9 @@ class VectorPool {
     }
   }
 
-  static inline uint64_t alloc_calls[16] = {};
-  static inline uint64_t miss_calls[16] = {};
-  static inline char* free_lists[16] = {};
+  static inline thread_local uint64_t alloc_calls[16] = {};
+  static inline thread_local uint64_t miss_calls[16] = {};
+  static inline thread_local char* free_lists[16] = {};
 };
 
 template <class T>
@@ -1019,8 +1036,13 @@ struct CutoffEntry {
 };
 #pragma pack(pop)
 
-Cache<ShapeEntry> common_bounds_cache("Common Bounds Cache", 13);
-Cache<CutoffEntry> cutoff_cache("Cut-off Cache", 16);
+#ifdef __clang__
+#define CONSTANT_INIT [[clang::require_constant_initialization]]
+#else
+#define CONSTANT_INIT
+#endif
+CONSTANT_INIT thread_local Cache<ShapeEntry> common_bounds_cache("Common Bounds Cache", 13);
+CONSTANT_INIT thread_local Cache<CutoffEntry> cutoff_cache("Cut-off Cache", 16);
 
 struct Trick {
   Shape shape;
@@ -1157,7 +1179,7 @@ struct Stat {
              depth, num_visits, double(num_branches) / num_visits, num_cutoff_collisions, num_cuts,
              num_cached_cuts, num_new_cuts, num_missed_cuts);
   }
-} stats[TOTAL_CARDS];
+} thread_local stats[TOTAL_CARDS];
 
 class Play {
  public:
@@ -2193,13 +2215,19 @@ void ShowDetailed(const Deal& deal, int rotation) { ToHands(deal).ShowDetailed(r
 
 // The deal, trump and discard setting the caches hold entries for; no trump
 // (-1) when they hold none.
-Hands cached_hands;
-int cached_trump = -1;
-bool cached_discard_suit_bottom = false;
+thread_local Hands cached_hands;
+thread_local int cached_trump = -1;
+thread_local bool cached_discard_suit_bottom = false;
 
 void ClearCaches() {
   common_bounds_cache.Reset();
   cutoff_cache.Reset();
+  cached_trump = -1;
+}
+
+void ReleaseCaches() {
+  common_bounds_cache.Release();
+  cutoff_cache.Release();
   cached_trump = -1;
 }
 
@@ -2208,6 +2236,8 @@ void ClearCaches() {
 // PGO training run must reset them as often as before, or Vector::clear()'s
 // profile shifts and SearchWithCache() gets ~1% slower.
 void UseCaches(const Hands& hands, int trump) {
+  common_bounds_cache.Ensure();
+  cutoff_cache.Ensure();
   if (cached_trump != -1 &&
       !(hands.Equals(cached_hands) && trump == cached_trump &&
         options.discard_suit_bottom == cached_discard_suit_bottom))
@@ -2302,6 +2332,30 @@ class PlaySequence {
     return MemoryEnhancedTestDriver(search, num_tricks, guess_ns_tricks);
   }
 
+  bool SolvePlayAtLeast(int card, int ns_tricks) {
+    if (played_cards.size() >= last_trick)
+      return min_max.play(last_trick).CollectLastTrick().first >= ns_tricks;
+    auto& play = min_max.play(played_cards.size());
+    play.PlayCard(card);
+    auto [result, _] = play.NextPlay().Search(ns_tricks);
+    play.UnplayCard();
+    return result >= ns_tricks;
+  }
+
+  std::vector<int> LegalCards() {
+    auto& play = min_max.play(played_cards.size());
+    std::vector<int> cards;
+    if (played_cards.size() >= last_trick) {
+      Hands hands = play.hands;
+      for (size_t p = last_trick; p < played_cards.size(); ++p)
+        hands[min_max.play(p).seat_to_play].Remove(played_cards[p]);
+      cards.push_back(hands[play.seat_to_play].Top());
+    } else {
+      for (int card : play.GetPlayableCards()) cards.push_back(card);
+    }
+    return cards;
+  }
+
  private:
   MinMax min_max;
   const int num_tricks;
@@ -2325,4 +2379,37 @@ int SolvePlay(const Deal& deal, int trump, int lead_seat, const std::vector<int>
   if (guess_ns_tricks == -1) guess_ns_tricks = GuessTricks(hands, trump);
   return PlaySequence(hands, trump, lead_seat, earlier_cards)
       .SolvePlay(played_cards.back(), guess_ns_tricks);
+}
+
+std::vector<int> SolvePlays(const Deal& deal, int trump, int lead_seat,
+                            const std::vector<int>& played_cards, const std::vector<int>& cards,
+                            int guess_ns_tricks) {
+  Hands hands = ToHands(deal);
+  assert(played_cards.size() < size_t(4 * hands.num_tricks()));
+  UseCaches(hands, trump);
+  if (guess_ns_tricks == -1) guess_ns_tricks = GuessTricks(hands, trump);
+  PlaySequence sequence(hands, trump, lead_seat, played_cards);
+  std::vector<int> ns_tricks;
+  for (int card : cards) {
+    ns_tricks.push_back(sequence.SolvePlay(card, guess_ns_tricks));
+    guess_ns_tricks = ns_tricks.back();
+  }
+  return ns_tricks;
+}
+
+bool SolvePlayAtLeast(const Deal& deal, int trump, int lead_seat,
+                      const std::vector<int>& played_cards, int card, int ns_tricks) {
+  Hands hands = ToHands(deal);
+  assert(played_cards.size() < size_t(4 * hands.num_tricks()));
+  if (ns_tricks <= 0) return true;
+  if (ns_tricks > hands.num_tricks()) return false;
+  UseCaches(hands, trump);
+  return PlaySequence(hands, trump, lead_seat, played_cards).SolvePlayAtLeast(card, ns_tricks);
+}
+
+std::vector<int> LegalCards(const Deal& deal, int trump, int lead_seat,
+                            const std::vector<int>& played_cards) {
+  Hands hands = ToHands(deal);
+  assert(played_cards.size() < size_t(4 * hands.num_tricks()));
+  return PlaySequence(hands, trump, lead_seat, played_cards).LegalCards();
 }

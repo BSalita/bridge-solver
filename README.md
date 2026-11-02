@@ -9,10 +9,17 @@ covers its features, from DD tables, par and single-dummy shuffles to
 playing out deals and endings, and shareable links.
 
 ## Build the solver
-Requirement: Linux or macOS on x86-64 or ARM64, with G++ or Clang installed.
+Requirement: Linux or macOS on x86-64 or ARM64, with G++ or Clang installed;
+or Windows with LLVM's Clang and Git Bash (run `./build.sh` there).
 ```
 make
 ```
+
+This builds the solver as a library, `libbsolver.so` (`bsolver.dll` on
+Windows), whose C++ API is `solver.h`, and the command line `solver` on top of
+it. It also builds `build/libdds.so` / `build/dds.dll`, the same library behind
+DDS's C API, so programs written for DDS or ddss can load it instead; see
+[dds/README.md](dds/README.md).
 
 To build the [web app](web/README.md), [Emscripten](https://emscripten.org) is required.
 See web/README.md for version requirements.

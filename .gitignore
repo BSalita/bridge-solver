@@ -40,3 +40,8 @@
 # Local run logs from run.sh / web/run.sh / parallel_run*.sh
 /results.*
 /web/results.*
+/build/
+/libbsolver.*
+/bsolver.*
+# ddss writes this on bad input (dds/test/compat.py)
+dump.txt

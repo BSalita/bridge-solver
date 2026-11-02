@@ -1,20 +1,72 @@
-// The command line of the double-dummy solver, built on the API in solver.h.
+// The command line of the double-dummy solver: a thin client of the solver
+// library's native calls in solver.h, which it links to (or is compiled with).
 #include <assert.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <conio.h>
+#include <fcntl.h>
+#include <io.h>
+#define NOMINMAX
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <sys/resource.h>
-#include <sys/time.h>
 #include <termios.h>
 #include <unistd.h>
+#endif
 
+#include <chrono>
 #include <map>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "solver.h"
+
+#ifdef _WIN32
+// POSIX getopt(), which the Windows C runtime lacks: flags may be grouped
+// ("-if file"), and an option's argument may follow it or be the next word.
+char* optarg = nullptr;
+int optind = 1;
+
+int getopt(int argc, char* const argv[], const char* spec) {
+  static int next = 0;  // position inside a group of flags
+  if (next == 0) {
+    if (optind >= argc || argv[optind][0] != '-' || argv[optind][1] == '\0') return -1;
+    if (strcmp(argv[optind], "--") == 0) {
+      ++optind;
+      return -1;
+    }
+    next = 1;
+  }
+  char c = argv[optind][next++];
+  const char* found = c == ':' ? nullptr : strchr(spec, c);
+  bool last = argv[optind][next] == '\0';
+  if (!found) {
+    fprintf(stderr, "%s: invalid option -- '%c'\n", argv[0], c);
+    if (last) ++optind, next = 0;
+    return '?';
+  }
+  if (found[1] == ':') {
+    if (!last) {
+      optarg = argv[optind] + next;
+    } else if (optind + 1 < argc) {
+      optarg = argv[++optind];
+    } else {
+      fprintf(stderr, "%s: option requires an argument -- '%c'\n", argv[0], c);
+      ++optind, next = 0;
+      return '?';
+    }
+    ++optind, next = 0;
+  } else if (last) {
+    ++optind, next = 0;
+  }
+  return c;
+}
+#endif
 
 struct CliOptions {
   char* code = nullptr;
@@ -73,9 +125,35 @@ struct CliOptions {
 } cli_options;
 
 double Now() {
-  timeval now;
-  gettimeofday(&now, nullptr);
-  return now.tv_sec + now.tv_usec * 1e-6;
+  using namespace std::chrono;
+  return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+// The process's peak memory so far, in MB.
+double PeakMemoryMb() {
+#ifdef _WIN32
+  PROCESS_MEMORY_COUNTERS counters = {};
+  GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof counters);
+  return counters.PeakWorkingSetSize / (1024.0 * 1024.0);
+#else
+  struct rusage usage;
+  getrusage(RUSAGE_SELF, &usage);
+  // ru_maxrss is KB on Linux, but bytes on macOS specifically -- other
+  // BSDs (FreeBSD/OpenBSD/NetBSD) report KB like Linux.
+#ifdef __APPLE__
+  return usage.ru_maxrss / (1024.0 * 1024.0);
+#else
+  return usage.ru_maxrss / 1024.0;
+#endif
+#endif
+}
+
+// One line of a deal file. Not in an assert(): NDEBUG would compile it away.
+void ReadLine(char* line, int size, FILE* input_file) {
+  if (!fgets(line, size, input_file)) {
+    fprintf(stderr, "Input file '%s' ends before its deal does.\n", cli_options.input_file);
+    exit(-1);
+  }
 }
 
 Deal ReadDeal(std::vector<int>& trumps, std::vector<int>& lead_seats) {
@@ -86,8 +164,8 @@ Deal ReadDeal(std::vector<int>& trumps, std::vector<int>& lead_seats) {
   }
   // read hands
   char line[NUM_SEATS][120];
-  assert(fgets(line[NORTH], sizeof(line[NORTH]), input_file));
-  assert(fgets(line[WEST], sizeof(line[WEST]), input_file));
+  ReadLine(line[NORTH], sizeof(line[NORTH]), input_file);
+  ReadLine(line[WEST], sizeof(line[WEST]), input_file);
   char* gap = strstr(line[WEST], "    ");
   if (!gap) gap = strstr(line[WEST], "\t");
   if (gap != nullptr && gap != line[WEST]) {
@@ -95,9 +173,9 @@ Deal ReadDeal(std::vector<int>& trumps, std::vector<int>& lead_seats) {
     strcpy(line[EAST], gap);
     *gap = '\0';
   } else {
-    assert(fgets(line[EAST], sizeof(line[EAST]), input_file));
+    ReadLine(line[EAST], sizeof(line[EAST]), input_file);
   }
-  assert(fgets(line[SOUTH], sizeof(line[SOUTH]), input_file));
+  ReadLine(line[SOUTH], sizeof(line[SOUTH]), input_file);
 
   Deal deal;
   for (int seat = 0; seat < NUM_SEATS; ++seat) deal.hands[seat] = line[seat];
@@ -359,6 +437,16 @@ class InteractivePlay {
 
   static char GetRawChar() {
     char buf = 0;
+#ifdef _WIN32
+    // A console gets keys without echo; piped input is read a byte at a time.
+    int num_read;
+    if (_isatty(0)) {
+      buf = (char)_getch();
+      num_read = 1;
+    } else {
+      num_read = _read(0, &buf, 1);
+    }
+#else
     struct termios old = {0};
     if (tcgetattr(0, &old) < 0) perror("tcsetattr()");
     old.c_lflag &= ~ICANON;
@@ -370,6 +458,7 @@ class InteractivePlay {
     old.c_lflag |= ICANON;
     old.c_lflag |= ECHO;
     if (tcsetattr(0, TCSADRAIN, &old) < 0) perror("tcsetattr ~ICANON");
+#endif
     if (num_read < 0) {
       perror("read()");
       exit(-1);
@@ -403,6 +492,10 @@ class InteractivePlay {
 };
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+  // Write line ends as is, as on other systems, so output compares byte for byte.
+  _setmode(_fileno(stdout), _O_BINARY);
+#endif
   cli_options.Read(argc, argv);
 
   Deal deal;
@@ -448,16 +541,7 @@ int main(int argc, char* argv[]) {
       printf(" %2d", IsNs(lead_seat) ? num_tricks - ns_tricks : ns_tricks);
     };
     auto trump_done = [start_time](int trump) {
-      struct rusage usage;
-      getrusage(RUSAGE_SELF, &usage);
-      // ru_maxrss is KB on Linux, but bytes on macOS specifically -- other
-      // BSDs (FreeBSD/OpenBSD/NetBSD) report KB like Linux.
-#ifdef __APPLE__
-      double peak_mb = usage.ru_maxrss / (1024.0 * 1024.0);
-#else
-      double peak_mb = usage.ru_maxrss / 1024.0;
-#endif
-      printf(" %5.2f s %5.1f M\n", Now() - start_time, peak_mb);
+      printf(" %5.2f s %5.1f M\n", Now() - start_time, PeakMemoryMb());
     };
     Solve(deal, trumps, lead_seats, trump_start, seat_done, trump_done);
   }
