@@ -223,6 +223,51 @@ Specifically, `S   9.4  9.4` means either South or North averages 9.4 tricks
 when declaring a spade contract. `48  50` on the same row shows South has 48%
 chance of making 4♠ while North has a slightly higher chance at 50%.
 
+## Check a claim
+
+A claim is valid when the claiming side takes its tricks however the cards it
+cannot see lie, not just as they actually lie, which is all a double-dummy
+result says: double dummy happily "makes" a claim that needs an onside finesse.
+The claimer sees their own hand and dummy's; the other two hands' cards may be
+split any way consistent with the play so far (hand sizes and show-outs), and
+are played by an adversary. A defender may claim too, but the claim must work
+whatever partner holds and however partner plays. This is how BBO's claim
+checker is described. The search is a port of the claim checker in
+[bridge-solver-rs](https://github.com/bridge-craftwork/bridge-solver), whose
+[design notes](https://github.com/bridge-craftwork/bridge-solver/blob/main/docs/claim-checker.md)
+explain it; it searches the same tree, node for node. A search has a node
+budget (2,000,000 by default); a claim that runs out is "undecided", which
+callers should treat as rejected, as BBO does.
+
+```
+./claim check claims.txt [--budget N]
+```
+
+checks one claim per line, `deal | trump | declarer | claimer | leader | tricks | plays`,
+the format of bridge-solver-rs's `bridge-claim check`: a PBN deal at the start
+of play (or an ending with four equal hands), S/H/D/C/NT, the seats, how many
+of the tricks still to play (counting one in progress) the claiming side says
+it will take, or `max` for the most it could claim, and the cards played so
+far, which may end mid-trick. Blank lines and `#` comments are skipped.
+
+```
+# South leads towards SAQ with West's king onside: double dummy takes both.
+N:AQ... ..32. 32... K4... | NT | S | S | S | 2 |
+N:AQ... ..32. 32... K4... | NT | S | S | S | max |
+# Partway through a hand: after 34 cards, declarer claims 2 of the 5 left.
+N:J96.JT8.AT752.K5 42.A97542.KJ3.Q4 AQ75.6.Q96.T9863 KT83.KQ3.84.AJ72 | S | S | S | W | 2 | HQ HJ HA H6 CQ C8 CJ C5 H5 S7 HK H8 D9 D8 DA DK DT D3 DQ D4 C6 CA CK C4 S8 SJ S2 SQ C9 C2 D7 DJ S5 SK
+```
+```
+claims.txt:2: Invalid (9 nodes, 0.2 ms)
+claims.txt:3: Valid up to 1 of 2 (32 nodes, 0.1 ms)
+claims.txt:5: Valid (705 nodes, 0.9 ms)
+```
+
+In code, `CheckClaim()` and `MaxClaim()` in `solver.h`; through DDS's C API,
+`CheckClaimBin()` and `CheckClaimPBN()` (see [dds/README.md](dds/README.md)).
+`tests/claim-test.sh` (part of `make test`) runs the Rust checker's tests and
+compares 512 claims with its verdicts (`tests/claims.tsv`).
+
 ## Performance
 
 Run one of the following commands to measure performance and check correctness.

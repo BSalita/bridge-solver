@@ -18,6 +18,10 @@
 //   twice, is RETURN_SUIT_OR_RANK; ddss reads past what it was given.
 // - Par, DealerPar, SidesPar and the text formatters are ddss's own code
 //   (vendor/), so their results are ddss's.
+//
+// CheckClaimBin and CheckClaimPBN are not DDS 2.9's but the claim checker's
+// (solver.h), which ddss has too: the same search, with nodes that differ
+// only in its double-dummy layout test.
 #include <stdio.h>
 #include <string.h>
 
@@ -568,6 +572,55 @@ int PlayFromPBN(const playTracePBN& pbn, playTraceBin* bin) {
 
 bool ThreadOK(int thrId) { return thrId >= 0 && thrId < Threads(); }
 
+// ---- Claims -------------------------------------------------------------------
+
+// CheckClaimBin(): the native claim checker on DDS's deal and play trace.
+int ClaimOne(const deal& dl, const playTraceBin& play, int declarer, int claimer,
+             int totalTricks, long long budget, claimResult* result) {
+  if (declarer < 0 || declarer > 3 || claimer < 0 || claimer > 3) return RETURN_CLAIM_SEAT;
+  if (totalTricks < -1) return RETURN_TARGET_WRONG_LO;
+  if (totalTricks > 13) return RETURN_TARGET_WRONG_HI;
+  Board b;
+  int ret = CheckBoard(dl, -1, 1, 1, &b);
+  if (ret != RETURN_NO_FAULT) return ret;
+  // The position from the start of the current trick: its cards, then the trace.
+  Start start = StartOf(b);
+  if (play.number < 0 || play.number > 52) return RETURN_PLAY_FAULT;
+  for (int i = 0; i < play.number; ++i) {
+    if (play.suit[i] < 0 || play.suit[i] > 3 || play.rank[i] < 2 || play.rank[i] > 14)
+      return RETURN_PLAY_FAULT;
+    start.played.push_back(SolverCard(play.suit[i], play.rank[i]));
+  }
+  uint64_t nodes = budget > 0 ? uint64_t(budget) : DDS_CLAIM_BUDGET;
+  int decl = SeatOf(declarer), claim = SeatOf(claimer);
+  // A claim of no more tricks is valid at once; it tells the tricks won, and
+  // whether the play is legal.
+  ClaimResult setup = CheckClaim(start.deal, start.trump, decl, claim, start.lead_seat,
+                                 start.played, 0, nodes);
+  if (!setup.error.empty()) return RETURN_PLAY_FAULT;
+  ClaimResult r;
+  if (totalTricks == -1) {
+    r = MaxClaim(start.deal, start.trump, decl, claim, start.lead_seat, start.played, nodes);
+  } else {
+    int tricks = std::max(0, totalTricks - setup.tricks_won);
+    if (tricks > setup.tricks_left) return RETURN_TARGET_TOO_HIGH;
+    r = CheckClaim(start.deal, start.trump, decl, claim, start.lead_seat, start.played, tricks,
+                   nodes);
+  }
+  if (!r.error.empty()) return RETURN_UNKNOWN_FAULT;
+  memset(result, 0, sizeof *result);
+  result->verdict = totalTricks == -1         ? 0
+                    : r.verdict == CLAIM_VALID   ? DDS_CLAIM_VALID
+                    : r.verdict == CLAIM_INVALID ? DDS_CLAIM_INVALID
+                                                 : DDS_CLAIM_UNDECIDED;
+  result->guaranteed = totalTricks == -1 ? setup.tricks_won + r.guaranteed : 0;
+  result->undecided = totalTricks == -1 && r.undecided;
+  result->tricksWon = setup.tricks_won;
+  result->tricksLeft = setup.tricks_left;
+  result->nodes = (long long)r.nodes;
+  return RETURN_NO_FAULT;
+}
+
 }  // namespace
 
 // ---- The API ------------------------------------------------------------------------
@@ -795,6 +848,31 @@ EXTERN_C DLLEXPORT void STDCALL GetDDSInfo(struct DDSInfo* info) {
            BS_VERSION, info->numCores, info->noOfThreads);
 }
 
+EXTERN_C DLLEXPORT int STDCALL CheckClaimBin(struct deal dl, struct playTraceBin play,
+                                             int declarer, int claimer, int totalTricks,
+                                             long long budget, struct claimResult* result,
+                                             int thrId) {
+  if (!ThreadOK(thrId)) return RETURN_THREAD_INDEX;
+  return ClaimOne(dl, play, declarer, claimer, totalTricks, budget, result);
+}
+
+EXTERN_C DLLEXPORT int STDCALL CheckClaimPBN(struct dealPBN dlPBN, struct playTracePBN playPBN,
+                                             int declarer, int claimer, int totalTricks,
+                                             long long budget, struct claimResult* result,
+                                             int thrId) {
+  if (!ThreadOK(thrId)) return RETURN_THREAD_INDEX;
+  deal dl;
+  dl.trump = dlPBN.trump;
+  dl.first = dlPBN.first;
+  memcpy(dl.currentTrickSuit, dlPBN.currentTrickSuit, sizeof dl.currentTrickSuit);
+  memcpy(dl.currentTrickRank, dlPBN.currentTrickRank, sizeof dl.currentTrickRank);
+  if (ConvertFromPBN(dlPBN.remainCards, dl.remainCards) != RETURN_NO_FAULT)
+    return RETURN_PBN_FAULT;
+  playTraceBin play;
+  if (PlayFromPBN(playPBN, &play) != RETURN_NO_FAULT) return RETURN_PLAY_FAULT;
+  return ClaimOne(dl, play, declarer, claimer, totalTricks, budget, result);
+}
+
 EXTERN_C DLLEXPORT void STDCALL ErrorMessage(int code, char line[80]) {
   const char* text;
   switch (code) {
@@ -825,6 +903,7 @@ EXTERN_C DLLEXPORT void STDCALL ErrorMessage(int code, char line[80]) {
     case RETURN_NO_SUIT: text = TEXT_NO_SUIT; break;
     case RETURN_TOO_MANY_TABLES: text = TEXT_TOO_MANY_TABLES; break;
     case RETURN_CHUNK_SIZE: text = TEXT_CHUNK_SIZE; break;
+    case RETURN_CLAIM_SEAT: text = TEXT_CLAIM_SEAT; break;
     default: text = "Not a DDS error code"; break;
   }
   snprintf(line, 80, "%s", text);

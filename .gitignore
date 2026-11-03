@@ -29,6 +29,7 @@
 
 # Native build products (see Makefile)
 /solver
+/claim
 /solver.p
 /solver.g
 /solver.m

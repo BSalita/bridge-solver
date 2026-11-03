@@ -10,6 +10,8 @@
 #                                                top as before (run.sh,
 #                                                tests/test.sh and the other
 #                                                scripts run ./solver)
+#   claim(.exe)                                  the claim checker's command
+#                                                line, on the same library
 #   build/dds.dll  / libdds.so                   DDS's API over the library
 #                                                (needs the library beside it,
 #                                                copied into build/)
@@ -17,8 +19,9 @@
 #                                                code linked in: one file to
 #                                                drop in where ddss was
 #
-# The library holds all of the solver (solver.cc, pool.cc, API in solver.h);
-# the command line (solver-cli.cc) and the DDS layer (dds/) are thin clients.
+# The library holds all of the solver (solver.cc, pool.cc, and the claim
+# checker in claim.cc and claim-engine.cc; API in solver.h); the command lines
+# (solver-cli.cc, claim-cli.cc) and the DDS layer (dds/) are thin clients.
 # They share its C++ API, so all are built with one compiler: clang++ on
 # Windows (Git Bash; MinGW g++ has only emulated thread-locals, ~28% slower),
 # g++ or clang++ on Linux and macOS (CXX=..., default clang++ if present).
@@ -28,9 +31,10 @@
 # stdout); dds-single.dll links the runtime in, so it is still a single file
 # for programs that only call DDS's C API.
 #
-# The profile comes from the two things the library is used for: the CLI on
-# deals/hard/deal.8 (the makefile's old training run) and dds/train.cc on
-# dds/train-deals.txt (tables plus every opening lead).
+# The profile comes from what the library is used for: the CLI on
+# deals/hard/deal.8 (the makefile's old training run), dds/train.cc on
+# dds/train-deals.txt (tables plus every opening lead) and the claim checker
+# on tests/claims.txt.
 set -euo pipefail
 cd "$(dirname "$0")"
 OUT=build
@@ -71,13 +75,14 @@ esac
 # shellcheck disable=SC2206
 OPTS+=(${EXTRA_OPTS:-})
 
-CORE=(solver.cc pool.cc)
+CORE=(solver.cc pool.cc claim.cc claim-engine.cc)
 DDS=(dds/dds-api.cc dds/vendor/Par.cpp dds/vendor/DealerPar.cpp dds/vendor/PBN.cpp)
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 
-train() {  # $1: the trainer for the DDS layer, $2: the CLI
+train() {  # $1: the trainer for the DDS layer, $2: the CLI, $3: the claim CLI
   "$1" < dds/train-deals.txt
   "$2" -if deals/hard/deal.8 > /dev/null
+  "$3" check tests/claims.txt > /dev/null
 }
 
 if [ -n "$IS_GCC" ]; then
@@ -97,9 +102,11 @@ if [ -n "$IS_GCC" ]; then
   objects core "${CORE[@]}"; CORE_OBJS=("${OBJS[@]}")
   objects dds "${DDS[@]}" dds/train.cc; DDS_OBJS=("${OBJS[@]}")
   objects cli solver-cli.cc; CLI_OBJS=("${OBJS[@]}")
+  objects claim claim-cli.cc; CLAIM_OBJS=("${OBJS[@]}")
   "$CXX" "${OPTS[@]}" -fprofile-generate -o "$work/train" "${CORE_OBJS[@]}" "${DDS_OBJS[@]}"
   "$CXX" "${OPTS[@]}" -fprofile-generate -o "$work/cli" "${CORE_OBJS[@]}" "${CLI_OBJS[@]}"
-  train "$work/train" "$work/cli"
+  "$CXX" "${OPTS[@]}" -fprofile-generate -o "$work/claim" "${CORE_OBJS[@]}" "${CLAIM_OBJS[@]}"
+  train "$work/train" "$work/cli" "$work/claim"
   # The library and its clients export the same way off Windows, so one set
   # of objects serves the library and the single-file DDS library.
   OBJ_FLAGS=(-DBS_BUILDING_LIBRARY -fprofile-use)
@@ -107,7 +114,9 @@ if [ -n "$IS_GCC" ]; then
   objects dds "${DDS[@]}"; DDS_OBJS=("${OBJS[@]}")
   OBJ_FLAGS=()
   objects plain solver-cli.cc; CLI_OBJS=("${OBJS[@]}")
+  objects plain claim-cli.cc; CLAIM_OBJS=("${OBJS[@]}")
   CORE_IN=("${CORE_OBJS[@]}"); DDS_IN=("${DDS_OBJS[@]}"); CLI_IN=("${CLI_OBJS[@]}")
+  CLAIM_IN=("${CLAIM_OBJS[@]}")
   CORE_FLAGS=(); DDS_FLAGS=(); SINGLE_FLAGS=()
 else
   LLVM_PROFDATA=${LLVM_PROFDATA:-$("$CXX" -print-prog-name=llvm-profdata)}
@@ -117,11 +126,12 @@ else
   GEN=(-fprofile-generate="$work/prof")
   "$CXX" "${OPTS[@]}" "${GEN[@]}" -o "$work/train$EXE" "${CORE[@]}" "${DDS[@]}" dds/train.cc
   "$CXX" "${OPTS[@]}" "${GEN[@]}" -o "$work/cli$EXE" "${CORE[@]}" solver-cli.cc
-  train "$work/train$EXE" "$work/cli$EXE"
+  "$CXX" "${OPTS[@]}" "${GEN[@]}" -o "$work/claim$EXE" "${CORE[@]}" claim-cli.cc
+  train "$work/train$EXE" "$work/cli$EXE" "$work/claim$EXE"
   "$LLVM_PROFDATA" merge -o "$work/merged.profdata" "$work"/prof/*.profraw
   USE=(-fprofile-use="$work/merged.profdata" -Wno-profile-instr-out-of-date
        -Wno-profile-instr-unprofiled)
-  CORE_IN=("${CORE[@]}"); DDS_IN=("${DDS[@]}"); CLI_IN=(solver-cli.cc)
+  CORE_IN=("${CORE[@]}"); DDS_IN=("${DDS[@]}"); CLI_IN=(solver-cli.cc); CLAIM_IN=(claim-cli.cc)
   CORE_FLAGS=("${USE[@]}" -DBS_BUILDING_LIBRARY); DDS_FLAGS=("${USE[@]}")
   SINGLE_FLAGS=("${USE[@]}")
 fi
@@ -148,11 +158,12 @@ esac
 SHARED=(-shared); [ $SYS = mac ] && SHARED=(-dynamiclib)
 
 "$CXX" "${OPTS[@]}" "${SHARE_CRT[@]}" -o "solver$EXE" "${CLI_IN[@]}" "${LINK_CORE[@]}"
+"$CXX" "${OPTS[@]}" "${SHARE_CRT[@]}" -o "claim$EXE" "${CLAIM_IN[@]}" "${LINK_CORE[@]}"
 "$CXX" "${OPTS[@]}" "${SHARE_CRT[@]}" "${DDS_FLAGS[@]}" "${SHARED[@]}" -o "$OUT/$DDS_LIB"   "${DDS_IN[@]}" "${LINK_CORE[@]}"
 "$CXX" "${OPTS[@]}" "${SINGLE_FLAGS[@]}" "${SHARED[@]}" -o "$OUT/$SINGLE_LIB" "${CORE_IN[@]}" "${DDS_IN[@]}"
 cp "$CORE_LIB" "$OUT/"
 rm -f "$OUT"/*.exp
 
 "./solver$EXE" -if deals/hard/deal.8 | tail -5
-echo "built solver$EXE $CORE_LIB $OUT/$DDS_LIB $OUT/$SINGLE_LIB" \
+echo "built solver$EXE claim$EXE $CORE_LIB $OUT/$DDS_LIB $OUT/$SINGLE_LIB" \
      "($(git rev-parse --short HEAD 2>/dev/null || echo unknown))"

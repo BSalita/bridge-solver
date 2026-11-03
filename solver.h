@@ -8,6 +8,8 @@
 #ifndef SOLVER_H
 #define SOLVER_H
 
+#include <stdint.h>
+
 #include <functional>
 #include <string>
 #include <vector>
@@ -132,6 +134,51 @@ BS_API void ReleaseCaches();
 // each group of equivalent cards.
 BS_API std::vector<int> LegalCards(const Deal& deal, int trump, int lead_seat,
                             const std::vector<int>& played_cards);
+
+// ---- Claims (claim.cc, claim-engine.cc) ----
+
+// Whether the claiming side can take its tricks however the cards the claimer
+// cannot see lie, not just as they actually lie, which is what a double-dummy
+// result answers. The claimer sees their own hand and dummy's; the other two
+// hands' cards may be split between those seats any way consistent with the
+// play so far (hand sizes and show-outs), and are played by an adversary. A
+// claim by declarer or dummy is declarer's; a defender's must work whatever
+// partner holds and however partner plays, though partner's tricks count.
+// This is how BBO's claim checker is described; bridge-solver-rs's
+// docs/claim-checker.md has the full design, which claim-engine.cc ports.
+//
+// A search has a node budget. A claim that runs out of it is UNDECIDED, which
+// callers treat as rejected, as BBO does; it is never a false INVALID.
+enum { CLAIM_VALID, CLAIM_INVALID, CLAIM_UNDECIDED };
+const uint64_t DEFAULT_CLAIM_BUDGET = 2000000;
+
+struct ClaimResult {
+  std::string error;  // Why there is no answer (a bad deal, an illegal play...); empty if none.
+  int verdict = CLAIM_UNDECIDED;  // CheckClaim(): the claim's.
+  int guaranteed = 0;      // MaxClaim(): the most of the tricks left proven guaranteed.
+  bool undecided = false;  // MaxClaim(): the budget ran out testing one more.
+  int tricks_won = 0;      // Tricks the claiming side has won in the tricks finished.
+  int tricks_left = 0;     // Tricks still to play, counting one in progress.
+  uint64_t nodes = 0;      // Search nodes, the double-dummy ones included.
+};
+
+// Whether the claiming side can take `tricks` of the tricks left after
+// `played_cards`, which `lead_seat` started and may end mid-trick. `deal` is
+// the hands at the start of play: a full deal or an ending, all four hands the
+// same size. `claimer` is any seat; dummy counts as declarer.
+BS_API ClaimResult CheckClaim(const Deal& deal, int trump, int declarer, int claimer,
+                              int lead_seat, const std::vector<int>& played_cards, int tricks,
+                              uint64_t budget = DEFAULT_CLAIM_BUDGET);
+
+// The largest claim the claimer could make there, within `budget` in all.
+BS_API ClaimResult MaxClaim(const Deal& deal, int trump, int declarer, int claimer, int lead_seat,
+                            const std::vector<int>& played_cards,
+                            uint64_t budget = DEFAULT_CLAIM_BUDGET);
+
+// Reads a PBN deal such as "N:AKQ.J6.KJ42.95 652.AK42.AQ87.T4 ..." (hands
+// clockwise from the seat named, suits S.H.D.C) into a Deal; false if it is
+// not one. The hands are not checked against each other.
+BS_API bool PbnToDeal(const char* pbn, Deal* deal);
 
 // ---- Many searches at once (pool.cc) ----
 

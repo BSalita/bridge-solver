@@ -2,7 +2,7 @@
 
 `dds-api.cc` puts DDS 2.9's C API on top of the solver library, so a program
 written for [ddss](https://github.com/BSalita/ddss) (a DDS 2.9 fork) or DDS can
-load this instead. It exports all 31 of ddss's functions, with ddss's struct
+load this instead. It exports all 33 of ddss's functions, with ddss's struct
 sizes (`include/dll.h`: `MAXNOOFTABLES` 1000, `MAXNOOFBOARDS` 5000), return
 codes, error texts and results.
 
@@ -42,6 +42,28 @@ On Windows, `dds.dll` and `bsolver.dll` need the Visual C++ runtime
   twice, is `RETURN_SUIT_OR_RANK`; ddss reads past what it was given.
 - `CalcDDtable` and friends on an ending (fewer than 13 cards each) give
   declarer's tricks out of the tricks left; ddss gives 13 minus the defence's.
+
+## Claims
+
+`CheckClaimBin()` and `CheckClaimPBN()` are not DDS 2.9's: they are the claim
+checker (see "Check a claim" in [../README.md](../README.md)), added to ddss
+and to this library alike, with the same declarations in `include/dll.h`.
+Given a deal at the start of play (`first` leads; a current trick may hold
+cards already played, as for `AnalysePlay*`), the cards played since, the
+declarer, the claimer and the claiming side's total for the hand (tricks
+already won included, as BBO and LIN's `mc` state it), they fill a
+`claimResult`: `DDS_CLAIM_VALID`, `DDS_CLAIM_INVALID` or `DDS_CLAIM_UNDECIDED`
+(the node budget ran out: treat it as rejected). A total of -1 asks for the
+largest valid claim instead. Both libraries search the same claim tree; their
+node counts differ only in the double-dummy layout test, which each runs with
+its own solver, so a claim right at the budget's edge may be decided by one and
+not the other.
+
+    python dds/test/claims.py build/dds.dll [<ddss dds.dll>] [--claims FILE...]
+
+checks each library against bridge-solver-rs's verdicts in
+`../tests/claims.tsv`, through the PBN and Bin calls and with the first trick's
+cards as a current trick, plus the error codes.
 
 ## Checking it against ddss
 

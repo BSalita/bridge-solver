@@ -166,6 +166,10 @@
 #define RETURN_CHUNK_SIZE -301
 #define TEXT_CHUNK_SIZE "Chunk size is less than 1"
 
+// CheckClaim*()
+#define RETURN_CLAIM_SEAT -401
+#define TEXT_CLAIM_SEAT "Declarer or claimer is not in 0 .. 3"
+
 
 
 struct futureTricks
@@ -346,6 +350,26 @@ struct solvedPlays
 {
   int noOfBoards;
   struct solvedPlay solved[MAXNOOFBOARDS];
+};
+
+/* CheckClaim*() verdicts, and its default node budget. */
+#define DDS_CLAIM_INVALID 0
+#define DDS_CLAIM_VALID 1
+#define DDS_CLAIM_UNDECIDED 2
+#define DDS_CLAIM_BUDGET 2000000
+
+struct claimResult
+{
+  int verdict; /* With totalTricks >= 0: DDS_CLAIM_VALID, DDS_CLAIM_INVALID,
+                  or DDS_CLAIM_UNDECIDED when the node budget ran out first
+                  (treat it as rejected, as BBO does) */
+  int guaranteed; /* With totalTricks == -1: the largest total the claiming
+                     side is proven to make, tricks already won included */
+  int undecided; /* With totalTricks == -1: 1 if the budget ran out testing
+                    one more trick, so a larger claim might be valid */
+  int tricksWon; /* Tricks the claiming side has won so far */
+  int tricksLeft; /* Tricks still to play, counting one in progress */
+  long long nodes; /* Search nodes visited */
 };
 
 struct DDSInfo
@@ -556,6 +580,46 @@ EXTERN_C DLLEXPORT int STDCALL AnalyseAllPlaysPBN(
   struct playTracesPBN * plpPBN,
   struct solvedPlays * solvedp,
   int chunkSize);
+
+/* Whether a claim holds however the cards the claimer cannot see lie, not
+   just as they actually lie (which is what double dummy answers). The
+   claimer sees their own hand and dummy; the other two hands may be split
+   any way consistent with the play (hand sizes and show-outs), and are
+   played by an adversary. A claim by declarer or dummy is declarer's; a
+   defender's must work whatever partner holds and however partner plays,
+   though partner's tricks count. This is how BBO's claim checker is
+   described; the search is a port of bridge-solver-rs's claim checker.
+
+   dl         the deal at the start of play: remainCards all four hands the
+              same size (a full deal or an ending), trump, and first, the
+              hand leading the first card. As for AnalysePlay*, a current
+              trick may hold cards already played.
+   play       the cards played since, in order; may end mid-trick.
+   declarer   the declaring hand, 0 .. 3 (N E S W); its partner is dummy.
+   claimer    the claiming hand, any of 0 .. 3.
+   totalTricks  the claiming side's total for the hand, tricks already won
+              included (BBO's claim, LIN's mc); -1 for the largest valid
+              claim instead.
+   budget     search nodes allowed; 0 or less for DDS_CLAIM_BUDGET. */
+EXTERN_C DLLEXPORT int STDCALL CheckClaimBin(
+  struct deal dl,
+  struct playTraceBin play,
+  int declarer,
+  int claimer,
+  int totalTricks,
+  long long budget,
+  struct claimResult * result,
+  int thrId);
+
+EXTERN_C DLLEXPORT int STDCALL CheckClaimPBN(
+  struct dealPBN dlPBN,
+  struct playTracePBN playPBN,
+  int declarer,
+  int claimer,
+  int totalTricks,
+  long long budget,
+  struct claimResult * result,
+  int thrId);
 
 EXTERN_C DLLEXPORT void STDCALL GetDDSInfo(
   struct DDSInfo * info);

@@ -10,9 +10,11 @@ build:
 	./build.sh
 sanitizer: solver.m solver.a
 
-# Fast correctness checks of the solver and its CLI (see tests/test.sh), ~5 s.
+# Fast correctness checks of the solver and its CLI (see tests/test.sh), ~5 s,
+# and of the claim checker (tests/claim-test.sh), ~15 s.
 test: build
 	tests/test.sh
+	tests/claim-test.sh
 
 # Benchmarks, pinned to PERF_CPU with huge pages (see tests/perf.sh); minutes.
 # PERF_SETS overrides the deal sets, e.g. PERF_SETS=deals/1k.
@@ -37,7 +39,7 @@ solver.a: $(SOURCES) $(HEADERS)
 	clang++ -std=c++17 $(STATIC) -O3 -fsanitize=address -o $@ $(SOURCES)
 	./$@ -if deals/hard/deal.1
 clean:
-	rm -rf build solver solver.exe solver.g solver.m solver.a pgo-data
+	rm -rf build solver solver.exe claim claim.exe solver.g solver.m solver.a pgo-data
 	rm -f libbsolver.so libbsolver.dylib bsolver.dll bsolver.lib
 	rm -f *.gcda *.gcno
 

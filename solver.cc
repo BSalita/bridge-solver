@@ -1378,6 +1378,7 @@ class Play {
   }
 
   Result EvaluatePlayableCards(int beta) {
+    ++nodes;
     STATS(++stats[depth].num_visits);
     ordered_cards.Reset();
     auto playable_cards = GetPlayableCards();
@@ -2030,7 +2031,9 @@ class Play {
   int card_played;
   int winning_play;
   OrderedCards ordered_cards;
+  uint64_t nodes = 0;  // Visits to EvaluatePlayableCards(), the nodes MinMax::Nodes() sums.
 
+  friend class MinMax;
   friend class PlaySequence;
 };
 
@@ -2052,6 +2055,13 @@ class MinMax {
   int Search(int beta) { return plays[0].Search(beta).first; }
 
   Play& play(int i) { return plays[i]; }
+
+  // Nodes searched so far, at every depth.
+  uint64_t Nodes() const {
+    uint64_t nodes = 0;
+    for (const auto& play : plays) nodes += play.nodes;
+    return nodes;
+  }
 
  private:
   Hands hands;
@@ -2342,6 +2352,16 @@ class PlaySequence {
     return result >= ns_tricks;
   }
 
+  // Whether N/S take at least `ns_tricks` from the position after the played
+  // cards, which may end mid-trick; adds the nodes searched to *nodes.
+  bool AtLeast(int ns_tricks, uint64_t* nodes) {
+    if (played_cards.size() >= last_trick)
+      return min_max.play(last_trick).CollectLastTrick().first >= ns_tricks;
+    auto [result, _] = min_max.play(played_cards.size()).Search(ns_tricks);
+    *nodes += min_max.Nodes();
+    return result >= ns_tricks;
+  }
+
   std::vector<int> LegalCards() {
     auto& play = min_max.play(played_cards.size());
     std::vector<int> cards;
@@ -2412,4 +2432,36 @@ std::vector<int> LegalCards(const Deal& deal, int trump, int lead_seat,
   Hands hands = ToHands(deal);
   assert(played_cards.size() < size_t(4 * hands.num_tricks()));
   return PlaySequence(hands, trump, lead_seat, played_cards).LegalCards();
+}
+
+// The claim checker's layout test (claim.cc): whether N/S take at least
+// `ns_tricks` in a position given as each seat's unplayed cards in the
+// solver's card bits, with `played` cards (0 to 3) of the trick `lead_seat`
+// led already played. Adds the nodes searched to *nodes.
+//
+// The layouts of one claim are different deals with one trump, and the
+// caches keep their entries across them: an entry describes a position by
+// its shape and relative ranks, which is all a position's value depends on
+// for a given trump, which is how one search already shares entries between
+// positions with different cards. (bridge-solver-rs's layout test shares its
+// caches across layouts the same way.) `fresh` clears them, at a claim's
+// first layout, so that a claim's nodes don't depend on what the thread
+// searched before.
+bool ClaimLayoutAtLeast(const uint64_t unplayed[NUM_SEATS], int trump, int lead_seat,
+                        const int* trick, int played, int ns_tricks, bool fresh,
+                        uint64_t* nodes) {
+  Hands hands;
+  for (int seat = 0; seat < NUM_SEATS; ++seat) hands[seat] = Cards(unplayed[seat]);
+  std::vector<int> trick_cards(trick, trick + played);
+  for (int i = 0; i < played; ++i) hands[(lead_seat + i) % NUM_SEATS].Add(trick[i]);
+  if (ns_tricks <= 0) return true;
+  if (ns_tricks > hands.num_tricks()) return false;
+  common_bounds_cache.Ensure();
+  cutoff_cache.Ensure();
+  if (fresh || trump != cached_trump || options.discard_suit_bottom != cached_discard_suit_bottom)
+    ClearCaches();
+  cached_hands = hands;
+  cached_trump = trump;
+  cached_discard_suit_bottom = options.discard_suit_bottom;
+  return PlaySequence(hands, trump, lead_seat, trick_cards).AtLeast(ns_tricks, nodes);
 }
