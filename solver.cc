@@ -94,7 +94,7 @@ char rank_of[CARD_END];
 char card_of[NUM_SUITS][16];
 char name_of[CARD_END][4];
 
-int SuitOf(int card) { return SUIT_SPAN == 16 ? card / SUIT_SPAN : suit_of[card]; }
+int SuitOf(int card) { return SUIT_SPAN == 16 ? int(unsigned(card) / SUIT_SPAN) : suit_of[card]; }
 int RankOf(int card) { return rank_of[card]; }
 int CardOf(int suit, int rank) { return card_of[suit][rank]; }
 uint64_t MaskOf(int suit) { return 0x1fffULL << (suit * SUIT_SPAN); }
@@ -122,6 +122,10 @@ struct CardInitializer {
 } card_initializer;
 
 Options options;
+
+// The new trick-start bounds are tried only this close to the tricks needed.
+const int MAX_RANK_TRICK_GAP = 2;
+const int MAX_DRAW_TRUMP_GAP = 3;
 
 template <class T>
 int BitSize(T v) {
@@ -530,6 +534,58 @@ class Hands {
 
 Hands empty_hands;
 
+// The hands of a pattern, or of a position to match patterns against. The
+// cards in play are numbered from the top card of spades down to the bottom
+// card of clubs, which is where PackBits() puts them; `cards` has the cards of
+// the pattern (the rank winners: the top cards of each suit; every card in a
+// position), and `low` and `high` have the two bits of the seat holding each.
+// Positions of one shape have the same number of cards in each suit, so a
+// card's number means the same relative rank in all of them.
+class PatHands {
+ public:
+  PatHands() : low(0), high(0), cards(0) {}
+
+  // The whole hands of a position with `all_cards` in play.
+  PatHands(const Hands& hands, Cards all_cards)
+      : low(PackBits(hands[NORTH].Union(hands[SOUTH]).Value(), all_cards.Value())),
+        high(PackBits(hands[EAST].Union(hands[SOUTH]).Value(), all_cards.Value())),
+        cards(PackBits(all_cards.Value(), all_cards.Value())) {}
+
+  // These hands reduced to `kept_cards`, numbered as above.
+  PatHands Keep(uint64_t kept_cards) const {
+    PatHands kept;
+    kept.low = low & kept_cards;
+    kept.high = high & kept_cards;
+    kept.cards = kept_cards;
+    return kept;
+  }
+
+  int Size() const { return __builtin_popcountll(cards); }
+  uint64_t CardNumbers() const { return cards; }
+
+  // Whether every card here is in the same seat's hand in `other`.
+  bool IncludedIn(const PatHands& other) const {
+    return ((((low ^ other.low) | (high ^ other.high)) & cards) | (cards & ~other.cards)) == 0;
+  }
+
+  // The same for a position, which has every card, given by its two bit planes.
+  bool Matches(uint64_t position_low, uint64_t position_high) const {
+    return (((low ^ position_low) | (high ^ position_high)) & cards) == 0;
+  }
+  uint64_t Low() const { return low; }
+  uint64_t High() const { return high; }
+
+  bool Equals(const PatHands& other) const {
+    return low == other.low && high == other.high && cards == other.cards;
+  }
+
+  // The seat holding a card, by number.
+  int SeatOf(int number) const { return (low >> number & 1) + (high >> number & 1) * 2; }
+
+ private:
+  uint64_t low, high, cards;
+};
+
 template <class Entry>
 class Cache {
  public:
@@ -543,22 +599,27 @@ class Cache {
   void Ensure() {
     if (entries) return;
     entries = new Entry[size];
+    used = new uint32_t[size];
+    for (int i = 0; i < size; ++i) entries[i].Reset(0);
     Reset();
   }
 
   // Frees the table, back to its initial size; Ensure() makes a new one.
   void Release() {
     delete[] entries;
+    delete[] used;
     entries = nullptr;
+    used = nullptr;
     bits = initial_bits;
     size = 1 << bits;
     load_count = 0;
   }
 
+  // Empties the entries in use; the table keeps its size, most of which is usually unused.
   void Reset() {
+    if (entries)
+      for (int i = 0; i < load_count; ++i) entries[used[i]].Reset(0);
     load_count = lookups = lookup_probes = hits = updates = update_probes = overwrites = 0;
-    if (!entries) return;
-    for (int i = 0; i < size; ++i) entries[i].Reset(0);
   }
 
   void ShowStatistics() const {
@@ -615,7 +676,7 @@ class Cache {
         return &entry;
       }
       if (entry.hash == 0) {
-        ++load_count;
+        used[load_count++] = uint32_t((index + d) & (size - 1));
         entry.Reset(hash);
         return &entry;
       }
@@ -633,6 +694,8 @@ class Cache {
     entries = new Entry[size];
     CHECK(entries);
     for (int i = 0; i < size; ++i) entries[i].hash = 0;
+    delete[] used;
+    used = new uint32_t[size];
 
     // Move entries in the old cache to the new cache.
     load_count = 0;
@@ -644,7 +707,7 @@ class Cache {
         Entry& entry = entries[(index + d) & (size - 1)];
         if (entry.hash == 0) {
           old_entries[i].MoveTo(entry);
-          ++load_count;
+          used[load_count++] = uint32_t((index + d) & (size - 1));
           break;
         }
       }
@@ -657,6 +720,7 @@ class Cache {
   int bits;
   int size;
   Entry* entries = nullptr;  // freed by Release(), else lives as long as its thread
+  uint32_t* used = nullptr;  // the indices of the load_count entries in use
 
   mutable int load_count = 0;
   mutable int lookups = 0, lookup_probes = 0, hits = 0;
@@ -687,10 +751,7 @@ class Shape {
   }
 
   void PlayCards(int seat, int c1, int c2, int c3, int c4) {
-    value -= 1ULL << Offset(seat, SuitOf(c1));
-    value -= 1ULL << Offset((seat + 1) % NUM_SEATS, SuitOf(c2));
-    value -= 1ULL << Offset((seat + 2) % NUM_SEATS, SuitOf(c3));
-    value -= 1ULL << Offset((seat + 3) % NUM_SEATS, SuitOf(c4));
+    value -= Unit(seat, c1) + Unit(seat + 1, c2) + Unit(seat + 2, c3) + Unit(seat + 3, c4);
   }
 
   int SuitLength(int seat, int suit) const { return (value >> Offset(seat, suit)) & 0xf; }
@@ -701,31 +762,48 @@ class Shape {
 
  private:
   static int Offset(int seat, int suit) { return 60 - (seat * NUM_SUITS + suit) * 4; }
+  // One card of the suit of `card` in the hand of `seat`, which may be 4 or more.
+  static uint64_t Unit(int seat, int card) {
+    return 1ULL << Offset(seat & (NUM_SEATS - 1), SuitOf(card));
+  }
 
   uint64_t value;
 };
 
-// Free-list pool for Vector<T>'s backing storage: one LIFO list per
-// power-of-two capacity, refilled in SLAB_SIZE slabs and never freed.
+// Arena for Vector<T>'s backing storage. Blocks are carved in turn from large
+// chunks, so that what one search allocates lies together, and blocks freed
+// by a growing vector are reused through one LIFO list per power-of-two
+// capacity. Reset() forgets every block at once: the next blocks are carved
+// from the first chunk again, which is the memory used most recently. Chunks
+// are never freed.
 template <class T>
 class VectorPool {
  public:
   static char* Allocate(int size_class) {
     STATS(++alloc_calls[size_class]);
     char*& head = free_lists[size_class];
-    if (!head) {
-      STATS(++miss_calls[size_class]);
-      Refill(size_class);
+    if (head) {
+      char* block = head;
+      head = *reinterpret_cast<char**>(block);
+      return block;
     }
-    char* block = head;
-    head = *reinterpret_cast<char**>(block);
-    return block;
+    STATS(++miss_calls[size_class]);
+    return Carve(size_class);
   }
 
   static void Deallocate(char* block, int size_class) {
     char*& head = free_lists[size_class];
     *reinterpret_cast<char**>(block) = head;
     head = block;
+  }
+
+  // Takes back every block; no vector allocated here may be used afterwards.
+  static void Reset() {
+    for (auto& head : free_lists) head = nullptr;
+    current_chunk = nullptr;
+    cursor = limit = nullptr;
+    for (LargeBlock* large = large_blocks; large; large = large->next)
+      Deallocate(reinterpret_cast<char*>(large + 1), large->size_class);
   }
 
   static void ShowStatistics() {
@@ -742,25 +820,49 @@ class VectorPool {
   }
 
  private:
-  static constexpr size_t SLAB_SIZE = 8192;
+  static constexpr size_t CHUNK_SIZE = size_t{1} << 20;
 
-  // One allocation for a full slab, amortizing the malloc call across all of them.
-  static void Refill(int size_class) {
-    size_t block_bytes = (1ULL << size_class) * sizeof(T);
-    size_t num_blocks = SLAB_SIZE / block_bytes;
-    if (num_blocks == 0) num_blocks = 1;
-    char* slab = new char[num_blocks * block_bytes];
-    char*& head = free_lists[size_class];
-    for (size_t i = 0; i < num_blocks; ++i) {
-      char* block = slab + i * block_bytes;
-      *reinterpret_cast<char**>(block) = head;
-      head = block;
+  struct Chunk {
+    Chunk* next;
+  };
+  // A block too large for a chunk, allocated on its own and kept for reuse.
+  struct LargeBlock {
+    LargeBlock* next;
+    int size_class;
+  };
+
+  static char* Carve(int size_class) {
+    size_t block_bytes = (size_t{1} << size_class) * sizeof(T);
+    if (block_bytes > CHUNK_SIZE / 4) {
+      auto* large = reinterpret_cast<LargeBlock*>(new char[sizeof(LargeBlock) + block_bytes]);
+      large->next = large_blocks;
+      large->size_class = size_class;
+      large_blocks = large;
+      return reinterpret_cast<char*>(large + 1);
     }
+    if (size_t(limit - cursor) < block_bytes) {
+      Chunk*& next = current_chunk ? current_chunk->next : first_chunk;
+      if (!next) {
+        next = reinterpret_cast<Chunk*>(new char[CHUNK_SIZE]);
+        next->next = nullptr;
+      }
+      current_chunk = next;
+      cursor = reinterpret_cast<char*>(current_chunk + 1);
+      limit = reinterpret_cast<char*>(current_chunk) + CHUNK_SIZE;
+    }
+    char* block = cursor;
+    cursor += block_bytes;
+    return block;
   }
 
   static inline thread_local uint64_t alloc_calls[16] = {};
   static inline thread_local uint64_t miss_calls[16] = {};
   static inline thread_local char* free_lists[16] = {};
+  static inline thread_local Chunk* first_chunk = nullptr;
+  static inline thread_local Chunk* current_chunk = nullptr;
+  static inline thread_local char* cursor = nullptr;
+  static inline thread_local char* limit = nullptr;
+  static inline thread_local LargeBlock* large_blocks = nullptr;
 };
 
 template <class T>
@@ -777,17 +879,28 @@ class Vector {
     items = nullptr;
   }
 
+  // Drops the items without freeing them, for when the pool is reset as a whole.
+  void Forget() {
+    count = capacity = 0;
+    items = nullptr;
+  }
+
   void resize(size_t new_size) {
-    if (capacity < new_size) {
-      int size_class = new_size <= 1 ? 0 : 32 - __builtin_clz((unsigned)new_size - 1);
-      char* new_items = VectorPool<T>::Allocate(size_class);
-      memcpy(new_items, items, count * sizeof(T));
-      if (capacity) VectorPool<T>::Deallocate(items, __builtin_ctz(capacity));
-      items = new_items;
-      capacity = 1 << size_class;
-    }
+    if (capacity < new_size) Reserve(new_size);
     memset(items + count * sizeof(T), 0, (new_size - count) * sizeof(T));
     count = new_size;
+  }
+
+  // Adds an item that the caller must overwrite: it isn't zero-filled.
+  void push_back_uninitialized() {
+    if (capacity == count) Reserve(size_t(count) + 1);
+    ++count;
+  }
+
+  // Moves the items in [pos, end) up by one; item `end` must not own anything.
+  void ShiftUp(size_t pos, size_t end) {
+    for (size_t i = end; i > pos; --i)
+      memcpy(items + i * sizeof(T), items + (i - 1) * sizeof(T), sizeof(T));
   }
 
   size_t size() const { return count; }
@@ -803,6 +916,20 @@ class Vector {
     --count;
   }
 
+  void Reserve(size_t new_size) {
+    int size_class = new_size <= 1 ? 0 : 32 - __builtin_clz((unsigned)new_size - 1);
+    char* new_items = VectorPool<T>::Allocate(size_class);
+    // Most vectors are short: copy item by item rather than call memcpy().
+    if (count <= 8)
+      for (size_t i = 0; i < count; ++i)
+        memcpy(new_items + i * sizeof(T), items + i * sizeof(T), sizeof(T));
+    else
+      memcpy(new_items, items, count * sizeof(T));
+    if (capacity) VectorPool<T>::Deallocate(items, __builtin_ctz(capacity));
+    items = new_items;
+    capacity = 1 << size_class;
+  }
+
   void swap(Vector<T>& v) {
     std::swap(count, v.count);
     std::swap(capacity, v.capacity);
@@ -816,7 +943,7 @@ class Vector {
 };
 
 struct Pattern {
-  Hands hands;
+  PatHands hands;
   Bounds bounds;
   uint16_t order;
   Vector<Pattern> patterns;
@@ -824,8 +951,8 @@ struct Pattern {
   mutable uint16_t hits, cuts;
 #endif
 
-  Pattern(const Hands& hands = Hands(), Bounds bounds = Bounds())
-      : hands(hands), bounds(bounds), order(hands.all_cards().Size()) {
+  Pattern(const PatHands& hands = PatHands(), Bounds bounds = Bounds())
+      : hands(hands), bounds(bounds), order(hands.Size()) {
     STATS(hits = cuts = 0);
   }
 
@@ -845,26 +972,40 @@ struct Pattern {
     STATS(std::swap(cuts, p.cuts));
   }
 
-  static const Pattern* Lookup(const Vector<Pattern>& patterns, const Hands& hands, int beta) {
-    const Pattern* best = nullptr;
-    Lookup(patterns, hands, beta, best);
-    return best;
-  }
-
-  static void Lookup(const Vector<Pattern>& patterns, const Hands& hands, int beta,
-                     const Pattern*& best) {
-    for (size_t i = 0; i < patterns.size(); ++i) {
+  // Lookup() below with the scan of `patterns` itself inlined into the caller.
+  __attribute__((always_inline)) static const Pattern* Lookup(const Vector<Pattern>& patterns,
+                                                              const PatHands& hands, int beta) {
+    const uint64_t low = hands.Low(), high = hands.High();
+    for (size_t i = 0, size = patterns.size(); i < size; ++i) {
       auto& pattern = patterns[i];
-      if (!hands.Include(pattern.hands)) continue;
+      if (!pattern.hands.Matches(low, high)) continue;
       STATS(++pattern.hits);
       if (pattern.bounds.Cutoff(beta)) {
         STATS(++pattern.cuts);
-        best = &pattern;
-        return;
+        return &pattern;
       }
-      Lookup(pattern.patterns, hands, beta, best);
-      if (best) return;
+      if (pattern.patterns.size() == 0) continue;
+      if (auto* best = Lookup(pattern.patterns, low, high, beta)) return best;
     }
+    return nullptr;
+  }
+
+  // The first pattern, going down into the subpatterns of each pattern before the next one,
+  // that has the position's cards and bounds deciding `beta`. The position comes as its two
+  // bit planes so that they stay in registers.
+  __attribute__((noinline)) static const Pattern* Lookup(const Vector<Pattern>& patterns,
+                                                         uint64_t low, uint64_t high, int beta) {
+    for (size_t i = 0, size = patterns.size(); i < size; ++i) {
+      auto& pattern = patterns[i];
+      if (!pattern.hands.Matches(low, high)) continue;
+      STATS(++pattern.hits);
+      if (pattern.bounds.Cutoff(beta)) {
+        STATS(++pattern.cuts);
+        return &pattern;
+      }
+      if (auto* best = Lookup(pattern.patterns, low, high, beta)) return best;
+    }
+    return nullptr;
   }
 
   // Patterns are sorted by order, most generic first.
@@ -872,13 +1013,13 @@ struct Pattern {
     size_t n = patterns.size(), pos = 0;
     // Local copies: the compiler can't prove new_pattern is disjoint from
     // patterns, so it would reload these on every comparison.
-    const Hands new_hands = new_pattern.hands;
+    const PatHands new_hands = new_pattern.hands;
     const uint16_t new_order = new_pattern.order;
     const Bounds new_bounds = new_pattern.bounds;
     // Go under the most generic pattern including the new one.
     for (; pos < n && patterns[pos].order <= new_order; ++pos) {
       auto& pattern = patterns[pos];
-      if (!new_hands.Include(pattern.hands)) continue;
+      if (!pattern.hands.IncludedIn(new_hands)) continue;
       if (new_hands.Equals(pattern.hands))
         pattern.bounds = pattern.bounds.Intersect(new_bounds);
       else
@@ -891,7 +1032,7 @@ struct Pattern {
     size_t kept = pos;
     for (size_t i = pos; i < n; ++i) {
       auto& pattern = patterns[i];
-      if (!pattern.hands.Include(new_hands)) {
+      if (!new_hands.IncludedIn(pattern.hands)) {
         if (kept != i) patterns[kept].MoveFrom(pattern);
         ++kept;
       } else if (pattern.bounds.Include(new_bounds)) {
@@ -905,8 +1046,8 @@ struct Pattern {
     if (!sorted) Sort(new_pattern.patterns);
     // Shift the kept patterns one slot back and put the new pattern at pos.
     // Slot kept owns nothing, so memmove is safe like the relocation in Vector::resize().
-    if (kept == n) patterns.resize(n + 1);
-    memmove((void*)&patterns[pos + 1], (void*)&patterns[pos], (kept - pos) * sizeof(Pattern));
+    if (kept == n) patterns.push_back_uninitialized();
+    patterns.ShiftUp(pos, kept);
     patterns[pos].MoveFrom(new_pattern);
     while (patterns.size() > kept + 1) patterns.pop_back();
   }
@@ -918,7 +1059,7 @@ struct Pattern {
   }
 
   static void Append(Vector<Pattern>& patterns, Pattern& new_pattern) {
-    patterns.resize(patterns.size() + 1);
+    patterns.push_back_uninitialized();
     patterns.back().MoveFrom(new_pattern);
   }
 
@@ -931,13 +1072,7 @@ struct Pattern {
   }
 
   Cards GetRankWinners(Cards all_cards) const {
-    Cards relative_rank_winners = hands.all_cards();
-    Cards rank_winners;
-    for (int suit = 0; suit < NUM_SUITS; ++suit) {
-      if (!relative_rank_winners.Suit(suit)) continue;
-      rank_winners.Add(UnpackSuitBits(relative_rank_winners, all_cards, suit));
-    }
-    return rank_winners;
+    return Cards(UnpackBits(hands.CardNumbers(), all_cards.Value()));
   }
 
   int Size() const {
@@ -955,9 +1090,18 @@ struct Pattern {
           if (suit_length == 0)
             putchar('-');
           else {
-            auto rank_winners = hands[seat].Suit(suit);
-            for (int card : rank_winners) printf("%c", RankName(RankOf(card)));
-            for (int i = rank_winners.Size(); i < suit_length; ++i) putchar('x');
+            // Card numbers of the suit start after those of the suits before it.
+            int first = 0, winners = 0;
+            for (int s = 0; s < suit; ++s)
+              for (int t = 0; t < NUM_SEATS; ++t) first += shape.SuitLength(t, s);
+            int total = 0;
+            for (int t = 0; t < NUM_SEATS; ++t) total += shape.SuitLength(t, suit);
+            for (int i = 0; i < total; ++i)
+              if ((hands.CardNumbers() >> (first + i) & 1) && hands.SeatOf(first + i) == seat) {
+                printf("%c", RankName(ACE - i));
+                ++winners;
+              }
+            for (int i = winners; i < suit_length; ++i) putchar('x');
           }
           putchar(' ');
         }
@@ -971,7 +1115,8 @@ struct Pattern {
   }
 };
 
-struct ShapeEntry {
+// A cache line each, so that a lookup reads one line: the hash and the seat's patterns.
+struct alignas(64) ShapeEntry {
   uint64_t hash;
   Vector<Pattern> patterns[NUM_SEATS];
 #ifdef _DEBUG
@@ -999,9 +1144,11 @@ struct ShapeEntry {
     return total;
   }
 
+  // Only for an empty entry or when every entry is reset: ClearCaches() then takes back the
+  // patterns of all entries at once.
   void Reset(uint64_t hash_in) {
     hash = hash_in;
-    for (int s = 0; s < NUM_SEATS; ++s) patterns[s].clear();
+    for (int s = 0; s < NUM_SEATS; ++s) patterns[s].Forget();
 #ifdef _DEBUG
     shape = Shape();
 #endif
@@ -1015,6 +1162,8 @@ struct ShapeEntry {
 #endif
   }
 };
+
+static_assert(sizeof(ShapeEntry) == 64 && alignof(ShapeEntry) == 64, "one cache line");
 
 struct CutoffEntry {
   // Using 32-bit instead of 64-bit hash is safe because cut-off cards are
@@ -1047,50 +1196,19 @@ CONSTANT_INIT thread_local Cache<CutoffEntry> cutoff_cache("Cut-off Cache", 16);
 struct Trick {
   Shape shape;
   Cards all_cards;
-  Hands relative_hands;
   int lead_suit;
 
-  // A relative hand contains relative cards.
-  void ComputeRelativeHands(int depth, const Hands& hands) {
-    if (depth == 0) {
-      for (int suit = 0; suit < NUM_SUITS; ++suit)
-        ConvertToRelativeSuit(hands, suit, all_cards.Suit(suit));
-    } else {
-      // Recompute the relative cards for suits changed by the last trick.
-      auto prev_trick = this - 1;
-      auto prev_trick_cards = prev_trick->all_cards.Different(all_cards);
-      relative_hands = prev_trick->relative_hands;
-      while (prev_trick_cards) {
-        auto suit = SuitOf(prev_trick_cards.Top());
-#ifndef CHEAP_PACK_BITS
-        uint64_t removed = prev_trick_cards.Suit(suit).Value();
-#endif
-        prev_trick_cards.ClearSuit(suit);
-#ifndef CHEAP_PACK_BITS
-        // If every survivor outranks every played card (`removed & -removed`
-        // is the highest played), survivors keep relative positions 0..k-1,
-        // so just drop the positions above them and skip the PackBits calls.
-        uint64_t remaining = all_cards.Suit(suit).Value();
-        if (remaining < (removed & -removed)) {
-          uint64_t keep = ((1ULL << __builtin_popcountll(remaining)) - 1) << (suit * SUIT_SPAN);
-          Cards stale(MaskOf(suit) & ~keep);
-          for (int seat = 0; seat < NUM_SEATS; ++seat) relative_hands[seat].Remove(stale);
-          continue;
-        }
-#endif
-        ConvertToRelativeSuit(hands, suit, all_cards.Suit(suit));
-      }
-    }
-  }
-
-  // Whether a card is equivalent to one of the tried cards.
-  bool IsEquivalent(int card, Cards tried_suit_cards, Cards hand) const {
-    if (!tried_suit_cards) return false;
+  // If a card is equivalent to one of the tried cards, the rank positions from the higher of
+  // the two down to just above the lower one (never empty); else no cards.
+  Cards EquivalentRun(int card, Cards tried_suit_cards, Cards hand) const {
+    if (!tried_suit_cards) return Cards();
     if (auto above = tried_suit_cards.Slice(0, card))
-      if (all_cards.Slice(above.Bottom(), card) == hand.Slice(above.Bottom(), card)) return true;
+      if (all_cards.Slice(above.Bottom(), card) == hand.Slice(above.Bottom(), card))
+        return Cards(~0ULL).Slice(above.Bottom(), card);
     if (auto below = tried_suit_cards.Slice(card + 1, CARD_END))
-      if (all_cards.Slice(card, below.Top()) == hand.Slice(card, below.Top())) return true;
-    return false;
+      if (all_cards.Slice(card, below.Top()) == hand.Slice(card, below.Top()))
+        return Cards(~0ULL).Slice(card, below.Top());
+    return Cards();
   }
 
   Cards FilterEquivalent(Cards playable_cards) const {
@@ -1109,54 +1227,45 @@ struct Trick {
     return filtered_cards;
   }
 
-  // A pattern hand contains relative cards and rank-irrelevant cards.
-  std::pair<Hands, Cards> ComputePatternHands(Cards rank_winners) const {
-    Cards relative_rank_winners, extended_rank_winners;
+  // The cards of a pattern for a position won with `rank_winners`: in each suit, those from
+  // the top down to the lowest rank winner.
+  //
+  // `runs` are the equivalence runs the search of this trick relied on: where a side that
+  // had to fail with every card skipped a card as equivalent to a tried one, the rank
+  // positions from the higher of the two down to just above the lower one. A pattern whose
+  // lowest rank winner fell inside such a run would match positions where the two cards are
+  // not equivalent, so it is extended to the low end of the run. (Skips by a side that
+  // needed only one card to work, and skips of cards below every rank winner, need nothing:
+  // any low card does.)
+  Cards ComputePatternCards(const Hands& hands, Cards rank_winners, Cards runs) const {
+    Cards pattern_cards;
     for (int suit = 0; suit < NUM_SUITS; ++suit) {
       if (!rank_winners.Suit(suit)) continue;
 
-      int bottom_rank_winner = RelativeCard(rank_winners.Suit(suit).Bottom(), suit);
+      auto all_suit_cards = all_cards.Suit(suit);
+      // A run ends just above a card in play, so this stops at one.
+      int bottom_card = rank_winners.Suit(suit).Bottom();
+      while (runs.Include(bottom_card)) ++bottom_card;
+      // The number of cards kept, counting down from the top of the suit.
+      int kept = all_suit_cards.Slice(0, bottom_card).Size() + 1;
       for (int seat = 0; seat < NUM_SEATS; ++seat) {
-        if (!relative_hands[seat].Include(bottom_rank_winner)) continue;
-        auto suit_cards = relative_hands[seat].Suit(suit);
-        // Extend bottom rank winner to its lowest equivalent card.
-        bottom_rank_winner += __builtin_ctzll(~(suit_cards.Value() >> (bottom_rank_winner + 1)));
-        // Suit bottom can't win by rank. Compensate the inaccuracy of fast tricks.
-        if (bottom_rank_winner == relative_hands.all_cards().Suit(suit).Bottom())
-          // Extend bottom rank winner to its highest equivalent card and go one rank higher.
-          bottom_rank_winner -= __builtin_clzll(~(suit_cards.Value() << (63 - bottom_rank_winner)));
+        if (!hands[seat].Include(bottom_card)) continue;
+        // The seat's cards of the suit as relative cards, the top card of the suit at bit 0.
+        uint64_t suit_cards = PackBits(hands[seat].Value(), all_suit_cards.Value());
+        // If this seat holds every card from the bottom rank winner to the suit bottom, the
+        // cards above them already determine the suit: stop above them. (This also keeps
+        // the suit bottom, which can't win by rank, out of the pattern.)
+        int lowest = kept + __builtin_ctzll(~(suit_cards >> kept));
+        if (lowest == all_suit_cards.Size())
+          kept = lowest - __builtin_clzll(~(suit_cards << (64 - lowest)));
         break;
       }
-      relative_rank_winners.Add(Cards(MaskOf(suit)).Slice(0, bottom_rank_winner + 1));
-      extended_rank_winners.Add(UnpackSuitBits(relative_rank_winners, all_cards, suit));
+      pattern_cards.Add(Cards(UnpackBits((1ULL << kept) - 1, all_suit_cards.Value())));
     }
-
-    Hands pattern_hands;
-    for (int seat = 0; seat < NUM_SEATS; ++seat)
-      pattern_hands[seat] = relative_hands[seat].Intersect(relative_rank_winners);
-    return {pattern_hands, extended_rank_winners};
+    return pattern_cards;
   }
 
  private:
-  void ConvertToRelativeSuit(const Hands& hands, int suit, Cards all_suit_cards) {
-#ifdef POSITION_INDEPENDENT_BITS
-    for (int seat = 0; seat < NUM_SEATS; ++seat) {
-      auto packed = PackBits(hands[seat].Suit(suit).Value(), all_suit_cards.Value());
-      relative_hands[seat].ClearSuit(suit);
-      relative_hands[seat].Add(Cards(packed << (suit * SUIT_SPAN)));
-    }
-#else
-    // Pre-shift into the suit's own bit range so PackBits<4> applies.
-    int shift = suit * SUIT_SPAN;
-    auto suit_mask = all_suit_cards.Value() >> shift;
-    for (int seat = 0; seat < NUM_SEATS; ++seat) {
-      auto packed = PackBits<4>(hands[seat].Suit(suit).Value() >> shift, suit_mask);
-      relative_hands[seat].ClearSuit(suit);
-      relative_hands[seat].Add(Cards(packed << shift));
-    }
-#endif
-  }
-
   int RelativeRank(int card, int suit) const {
     return ACE - all_cards.Suit(suit).Slice(0, card).Size();
   }
@@ -1195,12 +1304,32 @@ class Play {
   typedef std::pair<int, Cards> Result;  // NS tricks and rank winners
 
   Result Search(int beta) {
-    if (!TrickStarting()) {
-      ns_tricks_won = PreviousPlay().ns_tricks_won;
-      seat_to_play = PreviousPlay().NextSeat();
-      return EvaluatePlayableCards(beta);
+    switch (depth & 3) {
+      case 0: return SearchWithCache(beta);
+      case 1: return SearchFollow<1>(beta);
+      case 2: return SearchFollow<2>(beta);
+      default: return SearchFollow<3>(beta);
     }
-    return SearchWithCache(beta);
+  }
+
+  // The code of a node is specialised by POS, the play's position in its trick
+  // (0 lead .. 3 last); POS -1 reads it from depth.
+  template <int POS>
+  Result SearchFollow(int beta) {
+    ns_tricks_won = PreviousPlay().ns_tricks_won;
+    seat_to_play = PreviousPlay().NextSeat();
+    return EvaluatePlayableCards<POS>(beta);
+  }
+
+  // Searches the play after this one, which is at POS.
+  template <int POS>
+  Result SearchNext(int beta) {
+    if constexpr (POS < 0)
+      return NextPlay().Search(beta);
+    else if constexpr (POS == 3)
+      return NextPlay().SearchWithCache(beta);
+    else
+      return NextPlay().template SearchFollow<POS + 1>(beta);
   }
 
   // Split out so non-trick-start calls skip this large frame's prologue. Only
@@ -1224,14 +1353,14 @@ class Play {
 
     if (remaining_tricks == 1) return CollectLastTrick();
 
-    trick->all_cards = hands.all_cards();
+    ComputeAllCards();
     ComputeShape();
-    trick->ComputeRelativeHands(depth, hands);
 
     const auto shape_hash = common_bounds_cache.Hash(trick->shape.Value());
     auto* shape_entry = common_bounds_cache.Lookup(shape_hash);
+    const PatHands position(hands, trick->all_cards);
     if (shape_entry) {
-      auto pattern = Pattern::Lookup(shape_entry->patterns[seat_to_play], trick->relative_hands,
+      auto pattern = Pattern::Lookup(shape_entry->patterns[seat_to_play], position,
                                      beta - ns_tricks_won);
       if (pattern) {
         auto rank_winners = pattern->GetRankWinners(trick->all_cards);
@@ -1247,13 +1376,16 @@ class Play {
       }
     }
 
+    equivalence_runs = Cards();
     auto [ns_tricks, rank_winners] = SearchWithSureTricks(beta);
     auto bounds = ns_tricks < beta
                       ? Bounds{0, char(ns_tricks - ns_tricks_won)}
                       : Bounds{char(ns_tricks - ns_tricks_won), char(remaining_tricks)};
 
-    auto [pattern_hands, extended_rank_winners] = trick->ComputePatternHands(rank_winners);
-    Pattern new_pattern(pattern_hands, bounds);
+    auto extended_rank_winners =
+        trick->ComputePatternCards(hands, rank_winners, equivalence_runs);
+    Pattern new_pattern(
+        position.Keep(PackBits(extended_rank_winners.Value(), trick->all_cards.Value())), bounds);
     VERBOSE(ShowPattern("update", new_pattern, trick->shape));
     auto* new_shape_entry = common_bounds_cache.Update(shape_hash);
 #ifdef _DEBUG
@@ -1267,7 +1399,10 @@ class Play {
   Result SearchWithSureTricks(int beta) {
     bool with_trumps = trump != NOTRUMP && trick->all_cards.Suit(trump);
 
-    auto [lead_tricks, lead_rank_winners] = FastTricks();
+    int side_tricks = 0;
+    Cards side_rank_winners;
+    auto [lead_tricks, lead_rank_winners] = FastTricks(15, &side_tricks, &side_rank_winners);
+    const bool from_fast_tricks = lead_tricks > 0;
     if (lead_tricks == 0 && with_trumps)
       std::tie(lead_tricks, lead_rank_winners) = SlowTrumpTricks(
           MySuit(trump), PdSuit(trump), LhoSuit(trump), RhoSuit(trump), /*leading=*/true);
@@ -1280,10 +1415,49 @@ class Play {
       }
     }
     auto ns_tricks = SureTrickCutoff(beta, lead_tricks, NsToPlay(), /*leading=*/true);
+    if (ns_tricks >= 0 && from_fast_tricks && lead_rank_winners) {
+      // The cut may need fewer tricks than there are: keep only the rank winners of the
+      // tricks it needs, for a pattern that matches more positions.
+      int need =
+          NsToPlay() ? beta - ns_tricks_won : ns_tricks_won + hands.num_tricks() - beta + 1;
+      if (MinimizeFastTricks(need, with_trumps, lead_tricks, lead_rank_winners))
+        ns_tricks = SureTrickCutoff(beta, lead_tricks, NsToPlay(), /*leading=*/true);
+    }
     if (ns_tricks >= 0) return {ns_tricks, lead_rank_winners};
+
+    // Tricks each side still needs to decide this search.
+    const int remaining_tricks = hands.num_tricks();
+    const int lead_need =
+        NsToPlay() ? beta - ns_tricks_won : remaining_tricks - (beta - ns_tricks_won) + 1;
+    const int other_need = remaining_tricks - lead_need + 1;
+    if (with_trumps) {
+      const int lead_gap = lead_need - lead_tricks;
+      // Side-suit fast tricks, then the trump tricks one hand has by rank. That hand
+      // keeps its trumps meanwhile if it has enough other cards to play.
+      if (lead_gap <= MAX_RANK_TRICK_GAP && lead_need > side_tricks) {
+        Cards opp_trumps = LhoSuit(trump).Union(RhoSuit(trump));
+        for (int seat : {seat_to_play, Partner()}) {
+          Cards hand_trumps = hands[seat].Suit(trump);
+          if (hands[seat].Size() - hand_trumps.Size() < side_tricks) continue;
+          auto [trump_tricks, trump_rank_winners] =
+              TrumpRankTricks(hand_trumps, opp_trumps, lead_need - side_tricks);
+          if (trump_tricks > 0)
+            return {SureTrickCutoff(beta, side_tricks + trump_tricks, NsToPlay(), /*leading=*/true),
+                    side_rank_winners.Union(trump_rank_winners)};
+        }
+      }
+      if (lead_gap <= MAX_DRAW_TRUMP_GAP) {
+        auto [draw_tricks, draw_rank_winners] = DrawTrumpsThenCash();
+        if (draw_tricks >= lead_need)
+          return {SureTrickCutoff(beta, draw_tricks, NsToPlay(), /*leading=*/true),
+                  draw_rank_winners};
+      }
+    }
 
     auto [other_tricks, other_rank_winners] =
         with_trumps ? TopTrumpTricks(LhoSuit(trump), RhoSuit(trump)) : OtherSlowNoTrumpTricks();
+    if (!with_trumps && other_tricks == 0 && other_need == 1)
+      std::tie(other_tricks, other_rank_winners) = CannotTakeAllNoTrump(seat_to_play);
     if (other_tricks == 0 && with_trumps)
       std::tie(other_tricks, other_rank_winners) = SlowTrumpTricks(
           LhoSuit(trump), RhoSuit(trump), PdSuit(trump), MySuit(trump), /*leading=*/false);
@@ -1294,11 +1468,114 @@ class Play {
         other_tricks = length_tricks;
         other_rank_winners = {};
       }
+      if (other_need - other_tricks == 1) {
+        Cards our_trumps = MySuit(trump).Union(PdSuit(trump));
+        for (int seat : {LeftHandOpp(), RightHandOpp()}) {
+          auto [trump_tricks, trump_rank_winners] =
+              TrumpRankTricks(hands[seat].Suit(trump), our_trumps, other_need);
+          if (trump_tricks > 0) {
+            other_tricks = trump_tricks;
+            other_rank_winners = trump_rank_winners;
+            break;
+          }
+        }
+      }
     }
     ns_tricks = SureTrickCutoff(beta, other_tricks, !NsToPlay(), /*leading=*/false);
     if (ns_tricks >= 0) return {ns_tricks, other_rank_winners};
 
-    return EvaluatePlayableCards(beta);
+    return EvaluatePlayableCards<0>(beta);
+  }
+
+  // Given fast tricks that cut needing only `need` of them, looks for the same cut with
+  // fewer rank winners; returns whether it changed the tricks and rank winners.
+  bool MinimizeFastTricks(int need, bool with_trumps, int& lead_tricks,
+                          Cards& lead_rank_winners) const {
+    // Trump length tricks need no rank winners.
+    if (with_trumps) {
+      int length_tricks =
+          TrumpLengthTricks(MySuit(trump), PdSuit(trump), LhoSuit(trump), RhoSuit(trump));
+      if (length_tricks >= need) {
+        lead_tricks = length_tricks;
+        lead_rank_winners = {};
+        return true;
+      }
+    }
+    // The top cards of one suit.
+    if (SingleSuitFastTricks(need, lead_rank_winners)) {
+      lead_tricks = need;
+      return true;
+    }
+    if (lead_tricks == need) return false;
+    // Drop the suits the cut can do without, the one with the lowest rank winner first.
+    unsigned suit_mask = 15, tried_mask = 0;
+    bool reduced = false;
+    for (;;) {
+      int drop_suit = -1, lowest_rank = NUM_RANKS;
+      for (int suit = 0; suit < NUM_SUITS; ++suit) {
+        if (suit == trump || ((tried_mask >> suit) & 1) || !lead_rank_winners.Suit(suit)) continue;
+        int rank = RankOf(lead_rank_winners.Suit(suit).Bottom());
+        if (rank < lowest_rank) lowest_rank = rank, drop_suit = suit;
+      }
+      if (drop_suit < 0) break;
+      tried_mask |= 1u << drop_suit;
+      auto [tricks, rank_winners] = FastTricks(suit_mask & ~(1u << drop_suit));
+      if (tricks < need) continue;
+      suit_mask &= ~(1u << drop_suit);
+      lead_tricks = tricks;
+      lead_rank_winners = rank_winners;
+      reduced = true;
+      if (tricks == need) break;
+    }
+    return reduced;
+  }
+
+  // Whether the leader can cash `need` tricks from the top of one suit with fewer rank
+  // winners than `rank_winners`; if so, sets them.
+  bool SingleSuitFastTricks(int need, Cards& rank_winners) const {
+    Cards my_hand = hands[seat_to_play], pd_hand = hands[Partner()];
+    Cards lho_hand = hands[LeftHandOpp()], rho_hand = hands[RightHandOpp()];
+    const bool lho_has_trump = trump != NOTRUMP && lho_hand.Suit(trump);
+    const bool rho_has_trump = trump != NOTRUMP && rho_hand.Suit(trump);
+    Cards best_winners;
+    int best_score = -1;
+    for (int suit = 0; suit < NUM_SUITS; ++suit) {
+      Cards my_suit = my_hand.Suit(suit);
+      if (my_suit.Size() < need) continue;
+      if (suit != trump) {
+        // An opponent with trumps must follow suit to every one of the tricks.
+        int max_suit_winners = TOTAL_TRICKS;
+        if (lho_has_trump) max_suit_winners = lho_hand.Suit(suit).Size();
+        if (rho_has_trump)
+          max_suit_winners = std::min(max_suit_winners, rho_hand.Suit(suit).Size());
+        if (max_suit_winners < need) continue;
+      }
+      // Once the others have no card left in the suit, ranks no longer matter.
+      int max_rank_winners =
+          std::max(pd_hand.Suit(suit).Size(),
+                   std::max(lho_hand.Suit(suit).Size(), rho_hand.Suit(suit).Size()));
+      int winners = 0, lowest_winner = -1;
+      Cards suit_winners;
+      for (int card : trick->all_cards.Suit(suit)) {
+        if (winners == need || !my_suit.Include(card)) break;
+        ++winners;
+        if (winners <= max_rank_winners) {
+          suit_winners.Add(card);
+          lowest_winner = card;
+        }
+      }
+      if (winners < need) continue;
+      // Fewest rank winners, then the highest card.
+      int score = (TOTAL_TRICKS - suit_winners.Size()) * 16 +
+                  (lowest_winner < 0 ? 15 : RankOf(lowest_winner));
+      if (score > best_score) {
+        best_score = score;
+        best_winners = suit_winners;
+      }
+    }
+    if (best_score < 0 || best_winners.Size() >= rank_winners.Size()) return false;
+    rank_winners = best_winners;
+    return true;
   }
 
   int SureTrickCutoff(int beta, int sure_tricks, bool for_ns, bool leading) const {
@@ -1364,12 +1641,12 @@ class Play {
     const int remaining_tricks = hands.num_tricks();
     if (ns_tricks_won >= beta) return ns_tricks_won;
     if (ns_tricks_won + remaining_tricks < beta) return ns_tricks_won + remaining_tricks;
-    trick->all_cards = hands.all_cards();
+    ComputeAllCards();
     ComputeShape();
-    trick->ComputeRelativeHands(depth, hands);
     if (auto* shape_entry =
             common_bounds_cache.Lookup(common_bounds_cache.Hash(trick->shape.Value())))
-      if (auto pattern = Pattern::Lookup(shape_entry->patterns[seat_to_play], trick->relative_hands,
+      if (auto pattern = Pattern::Lookup(shape_entry->patterns[seat_to_play],
+                                         PatHands(hands, trick->all_cards),
                                          beta - ns_tricks_won)) {
         int lower = pattern->bounds.lower + ns_tricks_won;
         return lower >= beta ? lower : pattern->bounds.upper + ns_tricks_won;
@@ -1377,87 +1654,217 @@ class Play {
     return -1;
   }
 
+  // Second seat (from DDS QuickTricksSecondHand): our side surely wins this trick, by a ruff
+  // the third hand cannot overruff or by a card above the lead and all of the third hand's
+  // cards in the suit. In notrump the winner then cashes its top cards. Returns true with a
+  // bound in `result` if that is enough for a cut.
+  //
+  // The rank winners stand on their own: the claim holds wherever the cards from the top of
+  // each suit down to them are in the same hands, so it relies on no equivalence run.
+  bool SecondSeatSureTricks(int beta, Result& result) const {
+    const int lead = PreviousPlay().card_played, suit = SuitOf(lead);
+    const Cards my_hand = hands[seat_to_play], pd_hand = hands[Partner()];
+    const Cards third_hand = hands[LeftHandOpp()];
+    const Cards my_suit = my_hand.Suit(suit), pd_suit = pd_hand.Suit(suit);
+    const Cards third_suit = third_hand.Suit(suit);
+    const bool side_suit = trump != NOTRUMP && suit != trump;
+    if (side_suit && !third_suit && third_hand.Suit(trump)) return false;  // third hand ruffs
+    Cards rank_winners;
+    const Cards ours = my_suit.Union(pd_suit);
+    if (side_suit && ((!my_suit && my_hand.Suit(trump)) || (!pd_suit && pd_hand.Suit(trump)))) {
+      // We ruff; the third hand follows suit or has no trump. No rank matters.
+    } else {
+      if (!ours) return false;
+      const int top = ours.Top();
+      if (!HigherRank(top, lead) || (third_suit && !HigherRank(top, third_suit.Top())))
+        return false;
+      rank_winners.Add(top);
+    }
+    const int remaining = my_hand.Size();
+    const int needed =
+        NsToPlay() ? beta - ns_tricks_won : remaining - (beta - ns_tricks_won) + 1;
+    int sure_tricks = 1;
+    if (sure_tricks < needed) {
+      if (trump != NOTRUMP) return false;
+      // Notrump: the hand that wins this trick leads to the next one and cashes.
+      const Cards winner_hand =
+          !pd_suit || (my_suit && HigherRank(my_suit.Top(), pd_suit.Top())) ? my_hand : pd_hand;
+      const Cards all_cards = trick->all_cards;  // cards at the start of this trick
+      const Cards all_suit = all_cards.Suit(suit);
+      const int top = all_suit.Top();
+      if (winner_hand.Include(top)) {
+        const Cards rest = all_suit.Different(Cards().Add(top));
+        if (rest && winner_hand.Include(rest.Top())) {
+          ++sure_tricks;
+          rank_winners.Add(rest.Top());
+        }
+      }
+      for (int s = 0; s < NUM_SUITS && sure_tricks < needed; ++s) {
+        if (s == suit) continue;
+        const Cards hand_suit = winner_hand.Suit(s);
+        if (!hand_suit) continue;
+        // Only the lead has been played, so the other suits are as at the trick start.
+        const Cards all_s = all_cards.Suit(s);
+        if (all_s == hand_suit) {
+          sure_tricks += hand_suit.Size();
+        } else if (hand_suit.Include(all_s.Top())) {
+          ++sure_tricks;
+          rank_winners.Add(all_s.Top());
+        }
+      }
+      if (sure_tricks < needed) return false;
+    }
+    result = {NsToPlay() ? ns_tricks_won + sure_tricks : ns_tricks_won + remaining - sure_tricks,
+              rank_winners};
+    return true;
+  }
+
+  template <int POS>
   Result EvaluatePlayableCards(int beta) {
     ++nodes;
+    if (At<POS>(1)) {
+      Result result;
+      if (SecondSeatSureTricks(beta, result)) {
+        equivalence_runs = Cards();  // no card was skipped as equivalent to another
+        return result;
+      }
+    }
     STATS(++stats[depth].num_visits);
-    ordered_cards.Reset();
-    auto playable_cards = GetPlayableCards();
+    auto playable_cards = GetPlayableCards<POS>();
     VERBOSE(printf("%2d: all %lx playable %lx\n", depth, hands.all_cards().Value(),
                    playable_cards.Value()));
+    // Plays a card, searches the rest and takes the card back.
+    auto search_card = [this, beta](int card) -> Result {
+      STATS(++stats[depth].num_branches);
+      PlayCard<POS>(card);
+      VERBOSE(ShowTricks(beta, 0, true));
+      Result result = SearchNext<POS>(beta);
+      if (At<POS>(3)) result.second.Add(GetTrickRankWinner());
+      VERBOSE(ShowTricks(beta, result.first, false));
+      UnplayCard();
+      return result;
+    };
     // One choice (a single card, or equivalent cards in one suit): skip the cutoff cache.
     int top = playable_cards.Top(), bottom = playable_cards.Bottom();
     if (SuitOf(top) == SuitOf(bottom) &&
         trick->all_cards.Slice(top, bottom + 1) == playable_cards) {
-      STATS(++stats[depth].num_branches);
-      PlayCard(top);
-      VERBOSE(ShowTricks(beta, 0, true));
-      auto [ns_tricks, rank_winners] = NextPlay().Search(beta);
-      if (TrickEnding()) rank_winners.Add(GetTrickRankWinner());
-      VERBOSE(ShowTricks(beta, ns_tricks, false));
-      UnplayCard();
-      return {ns_tricks, rank_winners};
+      Result result = search_card(top);
+      equivalence_runs = NextRuns<POS>();
+      // A failure relies on the other cards of the run failing like the one played.
+      if (top != bottom && (NsToPlay() ? result.first < beta : result.first >= beta))
+        equivalence_runs.Add(Cards(~0ULL).Slice(top, bottom));
+      return result;
     }
-    const auto cutoff_hash = cutoff_cache.Hash(BuildCutoffIndex(beta));
-    int cutoff_card = LookupCutoffCard(cutoff_hash);
+
+    const auto cutoff_hash = cutoff_cache.Hash(BuildCutoffIndex<POS>(beta));
+    const int cutoff_card = LookupCutoffCard<POS>(cutoff_hash);
+    int card;
     if (playable_cards.Include(cutoff_card)) {
       VERBOSE(printf("%2d: use cutoff %s\n", depth, NameOf(cutoff_card)));
-      ordered_cards.AddCard(cutoff_card);
+      card = cutoff_card;
       playable_cards.Remove(cutoff_card);
     } else {
       STATS(stats[depth].num_cutoff_collisions += (cutoff_card != CARD_END));
-      OrderCards(playable_cards, beta);
+      ordered_cards.Reset();
+      OrderCards<POS>(playable_cards, beta);
       playable_cards = Cards();
+      card = ordered_cards.Card(0);
     }
 
-    int ns_tricks = NsToPlay() ? 0 : TOTAL_TRICKS;
+    // The first card: every rank is still relevant and no card was tried. It is tried outside
+    // the loop below as it cuts off most of the time, straight from the cut-off cache.
+    const bool ns_to_play = NsToPlay();
+    auto [ns_tricks, rank_winners] = search_card(card);
+    auto is_cutoff = [ns_to_play, beta](int tricks) {
+      return ns_to_play ? tricks >= beta : tricks < beta;
+    };
+    if (is_cutoff(ns_tricks)) {
+      STATS(++stats[depth].num_cuts);
+      if (card != cutoff_card) SaveCutoffCard<POS>(cutoff_hash, card);
+      // One card that works is enough: only its own play relies on equivalence runs.
+      equivalence_runs = NextRuns<POS>();
+      return {ns_tricks, LiftRunWinner(card, rank_winners)};
+    }
+    // The equivalence runs a failure of every card relies on.
+    Cards runs = NextRuns<POS>();
+
     int min_relevant_ranks[NUM_SUITS] = {TWO, TWO, TWO, TWO};
-    Cards rank_winners, tried_cards;
-    STATS(int num_branches = 0);
-    for (int i = 0; i < ordered_cards.Size(); ++i) {
-      int card = ordered_cards.Card(i), suit = SuitOf(card), rank = RankOf(card);
+    // If a card's rank is irrelevant, a relevant rank must be higher.
+    auto update_relevant_ranks = [&min_relevant_ranks](int card, Cards branch_rank_winners) {
+      int suit = SuitOf(card);
+      auto suit_rank_winners = branch_rank_winners.Suit(suit);
+      if (!suit_rank_winners)
+        min_relevant_ranks[suit] = NUM_RANKS;
+      else if (LowerRank(card, suit_rank_winners.Bottom()))
+        min_relevant_ranks[suit] =
+            std::max(min_relevant_ranks[suit], RankOf(suit_rank_winners.Bottom()));
+    };
+    update_relevant_ranks(card, rank_winners);
+    Cards tried_cards;
+    tried_cards.Add(card);
+    if (playable_cards) {  // the cut-off card didn't cut: order the other cards after it
+      ordered_cards.Reset();
+      ordered_cards.AddCard(card);
+      OrderCards<POS>(playable_cards, beta);
+    }
+    for (int i = 1; i < ordered_cards.Size(); ++i) {
+      card = ordered_cards.Card(i);
+      int suit = SuitOf(card), rank = RankOf(card);
       // Try a card if its rank is still relevant and it isn't equivalent to a tried card.
-      if (rank >= min_relevant_ranks[suit] &&
-          !trick->IsEquivalent(card, tried_cards.Suit(suit), hands[seat_to_play])) {
-        STATS(++stats[depth].num_branches);
-        STATS(++num_branches);
-        PlayCard(card);
-        VERBOSE(ShowTricks(beta, 0, true));
-        auto [branch_ns_tricks, branch_rank_winners] = NextPlay().Search(beta);
-        if (TrickEnding()) branch_rank_winners.Add(GetTrickRankWinner());
-        VERBOSE(ShowTricks(beta, branch_ns_tricks, false));
-        UnplayCard();
-
-        ns_tricks = NsToPlay() ? std::max(ns_tricks, branch_ns_tricks)
+      Cards equivalent_run;
+      if (rank >= min_relevant_ranks[suit]) {
+        equivalent_run = trick->EquivalentRun(card, tried_cards.Suit(suit), hands[seat_to_play]);
+        runs.Add(equivalent_run);
+      }
+      if (rank >= min_relevant_ranks[suit] && !equivalent_run) {
+        auto [branch_ns_tricks, branch_rank_winners] = search_card(card);
+        ns_tricks = ns_to_play ? std::max(ns_tricks, branch_ns_tricks)
                                : std::min(ns_tricks, branch_ns_tricks);
-        if (NsToPlay() ? ns_tricks >= beta : ns_tricks < beta) {  // cut-off
+        if (is_cutoff(ns_tricks)) {
           STATS(++stats[depth].num_cuts);
-          if (card != cutoff_card) {
-            SaveCutoffCard(cutoff_hash, card);
-            STATS(stats[depth].num_new_cuts += (cutoff_card == CARD_END));
-            STATS(stats[depth].num_missed_cuts += (cutoff_card != CARD_END));
-          } else {
-            STATS(++stats[depth].num_cached_cuts);
-          }
-          VERBOSE(printf("%2d: search cut @%d %s\n", depth, num_branches, NameOf(card)));
-          return {ns_tricks, branch_rank_winners};
+          if (card != cutoff_card) SaveCutoffCard<POS>(cutoff_hash, card);
+          // One card that works is enough: only its own play relies on equivalence runs.
+          equivalence_runs = NextRuns<POS>();
+          return {ns_tricks, LiftRunWinner(card, branch_rank_winners)};
         }
-
+        runs.Add(NextRuns<POS>());
         rank_winners.Add(branch_rank_winners);
-        // If this card's rank is irrelevant, a relevant rank must be higher.
-        auto suit_rank_winners = branch_rank_winners.Suit(suit);
-        if (!suit_rank_winners)
-          min_relevant_ranks[suit] = NUM_RANKS;
-        else if (LowerRank(card, suit_rank_winners.Bottom()))
-          min_relevant_ranks[suit] =
-              std::max(min_relevant_ranks[suit], RankOf(suit_rank_winners.Bottom()));
+        update_relevant_ranks(card, branch_rank_winners);
       }
       tried_cards.Add(card);
-      if (playable_cards) {
-        OrderCards(playable_cards, beta);
-        playable_cards = Cards();
-      }
     }
+    equivalence_runs = runs;
     return {ns_tricks, rank_winners};
+  }
+
+  // The equivalence runs that the result of the play after this one, at POS, relies on
+  // within this trick: none if that play starts the next trick.
+  template <int POS>
+  Cards NextRuns() const {
+    return At<POS>(3) ? Cards() : (this + 1)->equivalence_runs;
+  }
+
+  // At a cut, the card played could as well have been the top card of the run of equivalent
+  // cards it belongs to: the play after it is the same with the run's cards one place lower.
+  // If the card won the trick as the lowest rank winner of its suit and that other proof has
+  // higher rank winners, returns them.
+  Cards LiftRunWinner(int card, Cards rank_winners) const {
+    if (!rank_winners.Include(card)) return rank_winners;
+    int suit = SuitOf(card);
+    if (rank_winners.Suit(suit).Bottom() != card) return rank_winners;
+    Cards suit_cards = trick->all_cards.Suit(suit);
+    Cards higher = suit_cards.Slice(suit * SUIT_SPAN, card);
+    Cards others = higher.Different(hands[seat_to_play]);
+    Cards run_above = others ? higher.Slice(others.Bottom() + 1, card) : higher;
+    // No run, or its card just above this one would move onto it: nothing to gain.
+    if (!run_above || rank_winners.Include(run_above.Bottom())) return rank_winners;
+    Cards shifted;
+    shifted.Add(run_above.Top());
+    for (int c : rank_winners.Intersect(run_above))
+      shifted.Add(suit_cards.Slice(c + 1, CARD_END).Top());
+    rank_winners.Remove(run_above);
+    rank_winners.Remove(card);
+    return rank_winners.Union(shifted);
   }
 
   template <bool SUIT_CONTRACT>
@@ -1556,13 +1963,14 @@ class Play {
     ordered_cards.AddCards(playable_cards);
   }
 
+  template <int POS = -1>
   void OrderCards(Cards playable_cards, int beta) {
     CHECK(playable_cards);
     if (playable_cards.Size() == 1) {
       ordered_cards.AddCard(playable_cards.Top());
       return;
     }
-    if (TrickStarting()) {  // lead
+    if (At<POS>(0)) {  // lead
       const int start = ordered_cards.Size();
       trump == NOTRUMP ? Lead<false>(playable_cards) : Lead<true>(playable_cards);
       if (hands.num_tricks() >= 12) PromoteProbedLeads(start, beta);
@@ -1576,11 +1984,11 @@ class Play {
       if (!WinOver(playable_cards.Top(), winning_card))
         return ordered_cards.AddReversedCards(playable_cards);
       if (winning_seat == Partner() &&
-          (TrickEnding() || !lho_suit || HigherRank(winning_card, lho_suit.Top()) ||
+          (At<POS>(3) || !lho_suit || HigherRank(winning_card, lho_suit.Top()) ||
            lho_suit.Slice(0, winning_card) == lho_suit.Slice(0, playable_cards.Top())))
         // Partner can win or force LHO's winner.
         return ordered_cards.AddReversedCards(playable_cards);
-      if (SecondSeat() && pd_suit && HigherRank(pd_suit.Top(), winning_card)) {
+      if (At<POS>(1) && pd_suit && HigherRank(pd_suit.Top(), winning_card)) {
         if (lho_suit && HigherRank(lho_suit.Top(), pd_suit.Union(playable_cards).Top()) &&
             lho_suit.Slice(0, pd_suit.Top()) == lho_suit.Slice(0, playable_cards.Top()))
           // Play low as LHO may play a winner to prevent partner from winning.
@@ -1590,7 +1998,7 @@ class Play {
           return ordered_cards.AddReversedCards(playable_cards);
       }
       auto higher_cards = playable_cards.Slice(0, winning_card);
-      if (TrickEnding() || !lho_suit || HigherRank(higher_cards.Bottom(), lho_suit.Top()))
+      if (At<POS>(3) || !lho_suit || HigherRank(higher_cards.Bottom(), lho_suit.Top()))
         ordered_cards.AddReversedCards(higher_cards);
       else
         ordered_cards.AddCards(higher_cards);
@@ -1598,7 +2006,7 @@ class Play {
     }
     if (trump != NOTRUMP && playable_cards.Suit(trump)) {  // ruff
       if (winning_seat == Partner() &&
-          (TrickEnding() || (lho_suit && WinOver(winning_card, lho_suit.Top())))) {
+          (At<POS>(3) || (lho_suit && WinOver(winning_card, lho_suit.Top())))) {
         // Partner can win.
       } else {
         Cards my_trumps = playable_cards.Suit(trump);
@@ -1608,7 +2016,7 @@ class Play {
             ordered_cards.AddReversedCards(higher_trumps);
             playable_cards.Remove(higher_trumps);
           }
-        } else if (TrickEnding() || lho_suit || !hands[LeftHandOpp()].Suit(trump)) {
+        } else if (At<POS>(3) || lho_suit || !hands[LeftHandOpp()].Suit(trump)) {
           // The lowest trump is guaranteed to win.
           ordered_cards.AddCard(my_trumps.Bottom());
           playable_cards.Remove(my_trumps.Bottom());
@@ -1673,21 +2081,38 @@ class Play {
     char ordered_cards[TOTAL_TRICKS];
   };
 
+  // The cards in play at a trick start: those of the previous trick start less its four cards
+  // (reading all four hands right after a card was put back stalls on store forwarding).
+  void ComputeAllCards() const {
+    if (depth == 0) {
+      trick->all_cards = hands.all_cards();
+    } else {
+      Cards cards = (trick - 1)->all_cards;
+      cards.Remove((this - 4)->card_played);
+      cards.Remove((this - 3)->card_played);
+      cards.Remove((this - 2)->card_played);
+      cards.Remove((this - 1)->card_played);
+      trick->all_cards = cards;
+      CHECK(trick->all_cards == hands.all_cards());
+    }
+  }
+
   void ComputeShape() const {
     if (depth == 0) {
       trick->shape = Shape(hands);
     } else {
-      trick->shape = (trick - 1)->shape;
-      trick->shape.PlayCards(plays[depth - 4].seat_to_play, plays[depth - 4].card_played,
-                             plays[depth - 3].card_played, plays[depth - 2].card_played,
-                             plays[depth - 1].card_played);
+      Shape shape = (trick - 1)->shape;
+      shape.PlayCards((this - 4)->seat_to_play, (this - 4)->card_played, (this - 3)->card_played,
+                      (this - 2)->card_played, (this - 1)->card_played);
+      trick->shape = shape;
       CHECK(trick->shape == Shape(hands));
     }
   }
 
+  template <int POS = -1>
   Cards GetPlayableCards() const {
     const Cards& hand = hands[seat_to_play];
-    if (TrickStarting()) return hand;
+    if (At<POS>(0)) return hand;
 
     Cards suit_cards = hand.Suit(LeadSuit());
     if (suit_cards) return suit_cards;
@@ -1709,17 +2134,20 @@ class Play {
     return playable_cards;
   }
 
+  template <int POS = -1>
   void PlayCard(int card_to_play) {
     // remove played card from hand
     card_played = card_to_play;
     hands[seat_to_play].Remove(card_played);
 
     // who's winning?
-    if (TrickStarting()) trick->lead_suit = SuitOf(card_played);
-    if (TrickStarting() || WinOver(card_played, PreviousPlay().WinningCard())) {
-      winning_play = depth;
+    if (At<POS>(0)) trick->lead_suit = SuitOf(card_to_play);
+    if (At<POS>(0) || WinOver(card_to_play, PreviousPlay().winning_card)) {
+      winning_card = card_to_play;
+      winning_seat = seat_to_play;
     } else {
-      winning_play = PreviousPlay().winning_play;
+      winning_card = PreviousPlay().winning_card;
+      winning_seat = PreviousPlay().winning_seat;
     }
   }
 
@@ -1728,8 +2156,9 @@ class Play {
     hands[seat_to_play].Add(card_played);
   }
 
+  template <int POS = -1>
   uint64_t BuildCutoffIndex(int beta) const {
-    if (TrickStarting()) {
+    if (At<POS>(0)) {
       // 52 bits for my hand + 4 bits for partner's shape parity + 4 bits for NS tricks needed
       // in suit contracts (NT loses from splitting entries across MTD passes).
       uint64_t needed = trump == NOTRUMP ? 0 : beta - ns_tricks_won;
@@ -1739,7 +2168,7 @@ class Play {
       // 13/52 bits for all cards in suit + 6 bits for winner in the trick + 2 bits for lead seat.
       auto winner = PreviousPlay().WinningCard();
       return trick->all_cards.Suit(LeadSuit()).PackedValue() + (uint64_t(winner) << TOTAL_CARDS) +
-             (uint64_t(plays[depth & ~3].seat_to_play) << (TOTAL_CARDS + 6));
+             (uint64_t((this - Pos<POS>())->seat_to_play) << (TOTAL_CARDS + 6));
     } else {
       // 52 bits for my hand + 6 bits for winner in the trick + 4 bits for NS tricks needed
       // in suit contracts.
@@ -1750,14 +2179,16 @@ class Play {
     }
   }
 
+  template <int POS = -1>
   int LookupCutoffCard(decltype(cutoff_cache)::HashT hash) const {
     const auto* entry = cutoff_cache.Lookup(hash);
-    return entry ? entry->card[depth & 3] : CARD_END;
+    return entry ? entry->card[Pos<POS>()] : CARD_END;
   }
 
+  template <int POS = -1>
   void SaveCutoffCard(decltype(cutoff_cache)::HashT hash, int cutoff_card) const {
     auto* entry = cutoff_cache.Update(hash);
-    entry->card[depth & 3] = cutoff_card;
+    entry->card[Pos<POS>()] = cutoff_card;
   }
 
   Result TopTrumpTricks(Cards my_trumps, Cards pd_trumps) const {
@@ -1847,6 +2278,216 @@ class Play {
       return {1, rank_winners};
   }
 
+  // No trumps (or none left), the side of a_seat on lead: it can't take all
+  // the remaining tricks, so the other side gets one. Every trick is won in
+  // the suit led, and a side wins a suit at most as often as the longer of its
+  // two holdings.
+  // 1. The other side keeps the top cards of the suits it tops, so the side
+  //    wins tricks only in the suits it tops itself: too short, and it fails.
+  // 2. With stoppers: in a suit the side tops, the other side's highest card
+  //    stops it if its holder plays after the hand with all the higher cards
+  //    (no finesse) and has a lower card to play on each of them; the side
+  //    then wins that suit only as often as it has higher cards. A hand of the
+  //    other side keeps a card for each top card or stopper it is in charge
+  //    of, and has spare cards to play on the side's winners as long as
+  //    winners + cards in charge <= tricks.
+  // The rank winners are the top cards of the other side's suits and, for a
+  // stopped suit, its cards down to the stopper.
+  Result CannotTakeAllNoTrump(int a_seat) const {
+    const int b_seat[2] = {(a_seat + 1) & (NUM_SEATS - 1), (a_seat + 3) & (NUM_SEATS - 1)};
+    Cards a1 = hands[a_seat], a2 = hands[(a_seat + 2) & (NUM_SEATS - 1)];
+    Cards a_cards = a1.Union(a2);
+    int lengths = 0, winners = 0, in_charge[2] = {0, 0};
+    Cards top_rank_winners, stopper_rank_winners;
+    for (int suit = 0; suit < NUM_SUITS; ++suit) {
+      auto all_suit = trick->all_cards.Suit(suit);
+      if (!all_suit) continue;
+      int top = all_suit.Top();
+      if (!a_cards.Include(top)) {
+        ++in_charge[hands[b_seat[0]].Include(top) ? 0 : 1];
+        top_rank_winners.Add(top);
+        continue;
+      }
+      Cards a_suit = a_cards.Suit(suit);
+      int max_length = std::max(a1.Suit(suit).Size(), a2.Suit(suit).Size());
+      lengths += max_length;
+      if (Cards b_suit = all_suit.Different(a_suit)) {
+        int stopper = b_suit.Top();
+        int holder = hands[b_seat[0]].Include(stopper) ? 0 : 1;
+        // The hand playing just before the stopper's holder.
+        Cards before = hands[(b_seat[holder] + 3) & (NUM_SEATS - 1)];
+        Cards higher = a_suit.Slice(0, stopper);
+        if (before.Include(higher) && hands[b_seat[holder]].Suit(suit).Size() > higher.Size()) {
+          winners += higher.Size();
+          ++in_charge[holder];
+          stopper_rank_winners.Add(all_suit.Slice(0, stopper + 1));
+          continue;
+        }
+      }
+      winners += max_length;
+    }
+    if (lengths < hands.num_tricks()) return {1, top_rank_winners};
+    int most = std::max(in_charge[0], in_charge[1]);
+    if (most > 0 && winners + most <= hands.num_tricks())
+      return {1, top_rank_winners.Union(stopper_rank_winners)};
+    return {0, {}};
+  }
+
+  // The fast tricks of a notrump position given by four hands, me on lead.
+  Result FastTricksNoTrump(Cards my_hand, Cards pd_hand, Cards lho_hand, Cards rho_hand) const {
+    Cards all_cards = my_hand.Union(pd_hand).Union(lho_hand).Union(rho_hand);
+    Cards rank_winners, pd_rank_winners;
+    int my_tricks = 0, pd_tricks = 0;
+    bool my_entry = false, pd_entry = false;
+    for (int suit = 0; suit < NUM_SUITS; ++suit) {
+      auto my_suit = my_hand.Suit(suit);
+      auto pd_suit = pd_hand.Suit(suit);
+      int opp_max = std::max(lho_hand.Suit(suit).Size(), rho_hand.Suit(suit).Size());
+      int my_max_rank_winners = std::max(pd_suit.Size(), opp_max);
+      int pd_max_rank_winners = std::max(my_suit.Size(), opp_max);
+      int my_winners = 0, pd_winners = 0;
+      for (int card : all_cards.Suit(suit))
+        if (my_suit.Include(card)) {
+          ++my_winners;
+          if (my_winners <= my_max_rank_winners) rank_winners.Add(card);
+        } else if (pd_suit.Include(card)) {
+          ++pd_winners;
+          if (pd_winners <= pd_max_rank_winners) pd_rank_winners.Add(card);
+        } else
+          break;
+      my_tricks +=
+          SuitFastTricks(my_suit, my_winners, my_max_rank_winners, my_entry, pd_suit, pd_winners);
+      pd_tricks +=
+          SuitFastTricks(pd_suit, pd_winners, pd_max_rank_winners, pd_entry, my_suit, my_winners);
+    }
+    int fast_tricks = my_tricks;
+    if (pd_entry) {
+      fast_tricks = std::max(my_tricks, pd_tricks);
+      rank_winners.Add(pd_rank_winners);
+    }
+    return {std::min(fast_tricks, my_hand.Size()), rank_winners};
+  }
+
+  // Draws the opponents' trumps in `rounds` rounds with the top trumps `run`,
+  // all ours, whichever of us holds them, then counts the notrump fast tricks
+  // of the hand left on lead. Each round the hand on lead leads its lowest
+  // trump of the run, or its lowest trump to partner's lowest of the run.
+  Result DrawTrumpsWithRun(Cards run, int rounds) const {
+    Cards hand[2] = {hands[seat_to_play], hands[Partner()]};
+    int discards[2] = {0, 0};
+    int leader = 0;
+    for (int r = 0; r < rounds; ++r) {
+      int follower = 1 - leader;
+      Cards lead_trumps = hand[leader].Suit(trump), follow_trumps = hand[follower].Suit(trump);
+      if (!lead_trumps) return {0, {}};
+      if (!follow_trumps) ++discards[follower];
+      if (Cards lead_run = lead_trumps.Intersect(run)) {
+        int lead_card = lead_run.Bottom();
+        hand[leader].Remove(lead_card);
+        if (follow_trumps) {
+          int follow_card = follow_trumps.Bottom();
+          hand[follower].Remove(follow_card);
+          // The follower has only higher trumps: he wins the trick.
+          if (HigherRank(follow_card, lead_card)) leader = follower;
+        }
+      } else {
+        Cards follow_run = follow_trumps.Intersect(run);
+        if (!follow_run) return {0, {}};
+        hand[leader].Remove(lead_trumps.Bottom());
+        hand[follower].Remove(follow_run.Bottom());
+        leader = follower;
+      }
+    }
+    // A hand out of trumps discarded the lowest cards of its longest side suits.
+    for (int h = 0; h < 2; ++h)
+      for (; discards[h] > 0; --discards[h]) {
+        int longest = -1, length = 0;
+        for (int suit = 0; suit < NUM_SUITS; ++suit)
+          if (suit != trump && hand[h].Suit(suit).Size() > length) {
+            length = hand[h].Suit(suit).Size();
+            longest = suit;
+          }
+        if (longest < 0) return {0, {}};
+        hand[h].Remove(hand[h].Suit(longest).Bottom());
+      }
+    Cards lho_hand = hands[LeftHandOpp()], rho_hand = hands[RightHandOpp()];
+    lho_hand.ClearSuit(trump);
+    rho_hand.ClearSuit(trump);
+    auto [tricks, rank_winners] =
+        FastTricksNoTrump(hand[leader], hand[1 - leader], lho_hand, rho_hand);
+    return {std::min(rounds + tricks, hands.num_tricks()), rank_winners.Union(run)};
+  }
+
+  // We hold the top trumps needed to draw all the opponents' trumps: draw them,
+  // then the rest is a notrump position in which our other trumps are winners.
+  Result DrawTrumpsThenCash() const {
+    int rounds = std::max(LhoSuit(trump).Size(), RhoSuit(trump).Size());
+    if (rounds == 0) return {0, {}};
+    Cards ours = MySuit(trump).Union(PdSuit(trump));
+    Cards all_trumps = trick->all_cards.Suit(trump);
+    Cards run = KeepTop(all_trumps, rounds);
+    if (!ours.Include(run)) return {0, {}};
+    auto result = DrawTrumpsWithRun(run, rounds);
+    if (result.first > 0) return result;
+    // Two of the top trumps may fall together: retry with up to twice as many.
+    Cards long_run;
+    int count = 0;
+    for (int card : all_trumps) {
+      if (!ours.Include(card) || count == 2 * rounds) break;
+      long_run.Add(card);
+      ++count;
+    }
+    if (long_run == run) return {0, {}};
+    return DrawTrumpsWithRun(long_run, rounds);
+  }
+
+  // The most trumps of `trumps` that higher trumps of `opp_trumps` can beat,
+  // each used once.
+  static int TrumpKills(Cards trumps, Cards opp_trumps) {
+    int kills = 0;
+    while (trumps) {
+      int low = trumps.Bottom();
+      Cards higher = opp_trumps.Slice(0, low);
+      if (!higher) break;
+      ++kills;
+      trumps.Remove(low);
+      opp_trumps = higher;
+      opp_trumps.Remove(higher.Bottom());
+    }
+    return kills;
+  }
+
+  // Sure trump tricks of one hand by rank, whoever leads. Each trump the hand
+  // plays wins the trick for its side unless an opponent plays a higher trump
+  // on it, and an opponent's trump does that once. Pins as few top trumps as
+  // give `wanted` tricks: below the pinned cards any opposing trump may beat
+  // any of the hand's. With no card pinned this is TrumpLengthTricks().
+  Result TrumpRankTricks(Cards trumps, Cards opp_trumps, int wanted) const {
+    int n = trumps.Size();
+    if (wanted <= 0 || n < wanted) return {0, {}};
+    if (n - TrumpKills(trumps, opp_trumps) < wanted) return {0, {}};
+    Cards all_trumps = trick->all_cards.Suit(trump);
+    Cards rest = trumps;
+    int num_opp = opp_trumps.Size();
+    for (int i = 1; i <= n; ++i) {
+      int card = rest.Top();
+      rest.Remove(card);
+      Cards pinned = all_trumps.Slice(0, card + 1);
+      Cards pinned_opp = opp_trumps.Intersect(pinned);
+      int unpinned = n - i, unpinned_opp = num_opp - pinned_opp.Size();
+      // Unpinned opposing trumps beat unpinned trumps only.
+      int kills = std::min(unpinned, unpinned_opp);
+      // Pinned opposing trumps beat the other unpinned trumps, then lower pinned ones.
+      for (int k = unpinned - kills; k > 0 && pinned_opp; --k) {
+        pinned_opp.Remove(pinned_opp.Bottom());
+        ++kills;
+      }
+      kills += TrumpKills(trumps.Intersect(pinned), pinned_opp);
+      if (n - kills >= wanted) return {n - kills, pinned};
+    }
+    return {0, {}};
+  }
+
   // The n highest-ranked cards of a suit, i.e. its n lowest set bits.
   static Cards KeepTop(Cards suit, int n) {
     if (n <= 0) return Cards();
@@ -1864,7 +2505,10 @@ class Play {
 #endif
   }
 
-  Result FastTricks() const {
+  // `suit_mask` leaves out the side suits whose bit is clear. Also reports the side-suit
+  // part alone, before the cap to the hand's size.
+  Result FastTricks(unsigned suit_mask = 15, int* side_tricks = nullptr,
+                    Cards* side_rank_winners = nullptr) const {
     Cards my_hand = hands[seat_to_play], pd_hand = hands[Partner()];
     Cards lho_hand = hands[LeftHandOpp()], rho_hand = hands[RightHandOpp()];
     Cards pd_rank_winners;
@@ -1875,7 +2519,7 @@ class Play {
     const bool lho_has_trump = trump != NOTRUMP && lho_hand.Suit(trump);
     const bool rho_has_trump = trump != NOTRUMP && rho_hand.Suit(trump);
     for (int suit = 0; suit < NUM_SUITS; ++suit) {
-      if (suit == trump) continue;
+      if (suit == trump || !((suit_mask >> suit) & 1)) continue;
       auto my_suit = my_hand.Suit(suit);
       auto pd_suit = pd_hand.Suit(suit);
       auto lho_suit = lho_hand.Suit(suit);
@@ -1912,6 +2556,11 @@ class Play {
       rank_winners.Add(pd_rank_winners);
     } else
       fast_tricks = my_tricks;
+    if (side_tricks) {
+      *side_tricks = fast_tricks;
+      *side_rank_winners =
+          trump == NOTRUMP ? rank_winners : rank_winners.Different(Cards(MaskOf(trump)));
+    }
 
     if (trump != NOTRUMP) {
       // The long trump hand keeps its trumps while the fast tricks are cashed if it has
@@ -1955,9 +2604,12 @@ class Play {
 
   Cards GetTrickRankWinner() const {
     CHECK(TrickEnding());
-    int winning_card = WinningCard();
-    auto played_cards = trick->all_cards.Different(hands.all_cards());
-    return played_cards.Suit(SuitOf(winning_card)).Size() > 1 ? Cards().Add(winning_card) : Cards();
+    // The winner is a rank winner if another card of its suit was played to the trick.
+    int winning_card = WinningCard(), suit = SuitOf(winning_card);
+    int same_suit = (SuitOf((this - 3)->card_played) == suit) +
+                    (SuitOf((this - 2)->card_played) == suit) +
+                    (SuitOf((this - 1)->card_played) == suit) + (SuitOf(card_played) == suit);
+    return same_suit > 1 ? Cards().Add(winning_card) : Cards();
   }
 
   Result CollectLastTrick() const {
@@ -1995,6 +2647,15 @@ class Play {
     hands.Show();
   }
 
+  // Whether this play is at position p of its trick.
+  template <int POS>
+  bool At(int p) const {
+    return POS >= 0 ? POS == p : (depth & 3) == p;
+  }
+  template <int POS>
+  int Pos() const {
+    return POS >= 0 ? POS : depth & 3;
+  }
   bool TrickStarting() const { return (depth & 3) == 0; }
   bool SecondSeat() const { return (depth & 3) == 1; }
   bool ThirdSeat() const { return (depth & 3) == 2; }
@@ -2004,8 +2665,8 @@ class Play {
   bool WinOver(int c1, int c2) const {
     return SuitOf(c1) == SuitOf(c2) ? HigherRank(c1, c2) : SuitOf(c1) == trump;
   }
-  int WinningCard() const { return plays[winning_play].card_played; }
-  int WinningSeat() const { return plays[winning_play].seat_to_play; }
+  int WinningCard() const { return winning_card; }
+  int WinningSeat() const { return winning_seat; }
   int LeadSuit() const { return trick->lead_suit; }
   int NextSeat(int count = 1) const { return (seat_to_play + count) & (NUM_SEATS - 1); }
   int LeftHandOpp() const { return NextSeat(1); }
@@ -2029,8 +2690,12 @@ class Play {
   int ns_tricks_won = 0;
   int seat_to_play;
   int card_played;
-  int winning_play;
+  int winning_card;  // The card winning the trick so far, and the seat that played it.
+  int winning_seat;
   OrderedCards ordered_cards;
+  // The equivalence runs this play's last result relies on within its trick; see
+  // Trick::ComputePatternCards().
+  Cards equivalence_runs;
   uint64_t nodes = 0;  // Visits to EvaluatePlayableCards(), the nodes MinMax::Nodes() sums.
 
   friend class MinMax;
@@ -2231,6 +2896,7 @@ thread_local bool cached_discard_suit_bottom = false;
 
 void ClearCaches() {
   common_bounds_cache.Reset();
+  VectorPool<Pattern>::Reset();
   cutoff_cache.Reset();
   cached_trump = -1;
 }
@@ -2303,7 +2969,6 @@ class PlaySequence {
         }
         play.trick->all_cards = play.hands.all_cards();
         play.ComputeShape();
-        play.trick->ComputeRelativeHands(play.depth, play.hands);
       } else {
         play.ns_tricks_won = play.PreviousPlay().ns_tricks_won;
         play.seat_to_play = play.PreviousPlay().NextSeat();
