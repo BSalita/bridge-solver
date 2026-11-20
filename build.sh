@@ -68,7 +68,12 @@ case $SYS in
            CORE_LIB=bsolver.dll; DDS_LIB=dds.dll; SINGLE_LIB=dds-single.dll ;;
   mac)     OPTS+=(-fPIC -pthread)
            CORE_LIB=libbsolver.dylib; DDS_LIB=libdds.dylib; SINGLE_LIB=libdds-single.dylib ;;
-  linux)   OPTS+=(-fPIC -pthread)
+  linux)   # -fno-semantic-interposition: without it g++ assumes that any
+           # exported function may be replaced at load time (LD_PRELOAD) and
+           # so does not inline calls between them, which made the shared
+           # libraries about 1.5x slower on DD tables than the same code in
+           # an executable. clang++ compiles this way already.
+           OPTS+=(-fPIC -fno-semantic-interposition -pthread)
            CORE_LIB=libbsolver.so; DDS_LIB=libdds.so; SINGLE_LIB=libdds-single.so ;;
 esac
 [ -n "$IS_GCC" ] && OPTS+=(-Wno-missing-profile)
