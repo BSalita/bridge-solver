@@ -1656,7 +1656,7 @@ class Play {
       VERBOSE(printf("%2d: search cut @1 %s\n", depth, NameOf(card)));
       // One card that works is enough: only its own play relies on equivalence runs.
       equivalence_runs = NextRuns<POS>();
-      return {ns_tricks, LiftRunWinner(card, rank_winners)};
+      return {ns_tricks, rank_winners};
     }
     // The equivalence runs a failure of every card relies on.
     Cards runs = NextRuns<POS>();
@@ -1705,7 +1705,7 @@ class Play {
           VERBOSE(printf("%2d: search cut @%d %s\n", depth, i + 1, NameOf(card)));
           // One card that works is enough: only its own play relies on equivalence runs.
           equivalence_runs = NextRuns<POS>();
-          return {ns_tricks, LiftRunWinner(card, branch_rank_winners)};
+          return {ns_tricks, branch_rank_winners};
         }
         runs.Add(NextRuns<POS>());
         rank_winners.Add(branch_rank_winners);
@@ -1715,29 +1715,6 @@ class Play {
     }
     equivalence_runs = runs;
     return {ns_tricks, rank_winners};
-  }
-
-  // At a cut, the card played could as well have been the top card of the run of equivalent
-  // cards it belongs to: the play after it is the same with the run's cards one place lower.
-  // If the card won the trick as the lowest rank winner of its suit and that other proof has
-  // higher rank winners, returns them.
-  Cards LiftRunWinner(int card, Cards rank_winners) const {
-    if (!rank_winners.Include(card)) return rank_winners;
-    int suit = SuitOf(card);
-    if (rank_winners.Suit(suit).Bottom() != card) return rank_winners;
-    Cards suit_cards = trick->all_cards.Suit(suit);
-    Cards higher = suit_cards.Slice(suit * SUIT_SPAN, card);
-    Cards others = higher.Different(hands[seat_to_play]);
-    Cards run_above = others ? higher.Slice(others.Bottom() + 1, card) : higher;
-    // No run, or its card just above this one would move onto it: nothing to gain.
-    if (!run_above || rank_winners.Include(run_above.Bottom())) return rank_winners;
-    Cards shifted;
-    shifted.Add(run_above.Top());
-    for (int c : rank_winners.Intersect(run_above))
-      shifted.Add(suit_cards.Slice(c + 1, CARD_END).Top());
-    rank_winners.Remove(run_above);
-    rank_winners.Remove(card);
-    return rank_winners.Union(shifted);
   }
 
   template <bool SUIT_CONTRACT>
