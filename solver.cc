@@ -607,22 +607,27 @@ class Cache {
   void Ensure() {
     if (entries) return;
     entries = new Entry[size];
+    used = new uint32_t[size];
+    for (int i = 0; i < size; ++i) entries[i].Reset(0);
     Reset();
   }
 
   // Frees the table, back to its initial size; Ensure() makes a new one.
   void Release() {
     delete[] entries;
+    delete[] used;
     entries = nullptr;
+    used = nullptr;
     bits = initial_bits;
     size = 1 << bits;
     load_count = 0;
   }
 
+  // Empties the entries in use; the table keeps its size, most of which is usually unused.
   void Reset() {
+    if (entries)
+      for (int i = 0; i < load_count; ++i) entries[used[i]].Reset(0);
     load_count = lookups = lookup_probes = hits = updates = update_probes = overwrites = 0;
-    if (!entries) return;
-    for (int i = 0; i < size; ++i) entries[i].Reset(0);
   }
 
   void ShowStatistics() const {
@@ -679,7 +684,7 @@ class Cache {
         return &entry;
       }
       if (entry.hash == 0) {
-        ++load_count;
+        used[load_count++] = uint32_t((index + d) & (size - 1));
         entry.Reset(hash);
         return &entry;
       }
@@ -697,6 +702,8 @@ class Cache {
     entries = new Entry[size];
     CHECK(entries);
     for (int i = 0; i < size; ++i) entries[i].hash = 0;
+    delete[] used;
+    used = new uint32_t[size];
 
     // Move entries in the old cache to the new cache.
     load_count = 0;
@@ -708,7 +715,7 @@ class Cache {
         Entry& entry = entries[(index + d) & (size - 1)];
         if (entry.hash == 0) {
           old_entries[i].MoveTo(entry);
-          ++load_count;
+          used[load_count++] = uint32_t((index + d) & (size - 1));
           break;
         }
       }
@@ -721,6 +728,7 @@ class Cache {
   int bits;
   int size;
   Entry* entries = nullptr;  // freed by Release(), else lives as long as its thread
+  uint32_t* used = nullptr;  // the indices of the load_count entries in use
 
   mutable int load_count = 0;
   mutable int lookups = 0, lookup_probes = 0, hits = 0;
@@ -740,27 +748,40 @@ struct Bounds {
   bool Cutoff(int beta) const { return lower >= beta || upper < beta; }
 };
 
-// Free-list pool for Vector<T>'s backing storage: one LIFO list per
-// power-of-two capacity, refilled in SLAB_SIZE slabs and never freed.
+// Arena for Vector<T>'s backing storage. Blocks are carved in turn from large
+// chunks, so that what one search allocates lies together, and blocks freed
+// by a growing vector are reused through one LIFO list per power-of-two
+// capacity. Reset() forgets every block at once: the next blocks are carved
+// from the first chunk again, which is the memory used most recently. Chunks
+// are never freed.
 template <class T>
 class VectorPool {
  public:
   static char* Allocate(int size_class) {
     STATS(++alloc_calls[size_class]);
     char*& head = free_lists[size_class];
-    if (!head) {
-      STATS(++miss_calls[size_class]);
-      Refill(size_class);
+    if (head) {
+      char* block = head;
+      head = *reinterpret_cast<char**>(block);
+      return block;
     }
-    char* block = head;
-    head = *reinterpret_cast<char**>(block);
-    return block;
+    STATS(++miss_calls[size_class]);
+    return Carve(size_class);
   }
 
   static void Deallocate(char* block, int size_class) {
     char*& head = free_lists[size_class];
     *reinterpret_cast<char**>(block) = head;
     head = block;
+  }
+
+  // Takes back every block; no vector allocated here may be used afterwards.
+  static void Reset() {
+    for (auto& head : free_lists) head = nullptr;
+    current_chunk = nullptr;
+    cursor = limit = nullptr;
+    for (LargeBlock* large = large_blocks; large; large = large->next)
+      Deallocate(reinterpret_cast<char*>(large + 1), large->size_class);
   }
 
   static void ShowStatistics() {
@@ -777,25 +798,49 @@ class VectorPool {
   }
 
  private:
-  static constexpr size_t SLAB_SIZE = 8192;
+  static constexpr size_t CHUNK_SIZE = size_t{1} << 20;
 
-  // One allocation for a full slab, amortizing the malloc call across all of them.
-  static void Refill(int size_class) {
-    size_t block_bytes = (1ULL << size_class) * sizeof(T);
-    size_t num_blocks = SLAB_SIZE / block_bytes;
-    if (num_blocks == 0) num_blocks = 1;
-    char* slab = new char[num_blocks * block_bytes];
-    char*& head = free_lists[size_class];
-    for (size_t i = 0; i < num_blocks; ++i) {
-      char* block = slab + i * block_bytes;
-      *reinterpret_cast<char**>(block) = head;
-      head = block;
+  struct Chunk {
+    Chunk* next;
+  };
+  // A block too large for a chunk, allocated on its own and kept for reuse.
+  struct LargeBlock {
+    LargeBlock* next;
+    int size_class;
+  };
+
+  static char* Carve(int size_class) {
+    size_t block_bytes = (size_t{1} << size_class) * sizeof(T);
+    if (block_bytes > CHUNK_SIZE / 4) {
+      auto* large = reinterpret_cast<LargeBlock*>(new char[sizeof(LargeBlock) + block_bytes]);
+      large->next = large_blocks;
+      large->size_class = size_class;
+      large_blocks = large;
+      return reinterpret_cast<char*>(large + 1);
     }
+    if (size_t(limit - cursor) < block_bytes) {
+      Chunk*& next = current_chunk ? current_chunk->next : first_chunk;
+      if (!next) {
+        next = reinterpret_cast<Chunk*>(new char[CHUNK_SIZE]);
+        next->next = nullptr;
+      }
+      current_chunk = next;
+      cursor = reinterpret_cast<char*>(current_chunk + 1);
+      limit = reinterpret_cast<char*>(current_chunk) + CHUNK_SIZE;
+    }
+    char* block = cursor;
+    cursor += block_bytes;
+    return block;
   }
 
   static inline thread_local uint64_t alloc_calls[16] = {};
   static inline thread_local uint64_t miss_calls[16] = {};
   static inline thread_local char* free_lists[16] = {};
+  static inline thread_local Chunk* first_chunk = nullptr;
+  static inline thread_local Chunk* current_chunk = nullptr;
+  static inline thread_local char* cursor = nullptr;
+  static inline thread_local char* limit = nullptr;
+  static inline thread_local LargeBlock* large_blocks = nullptr;
 };
 
 template <class T>
@@ -812,17 +857,28 @@ class Vector {
     items = nullptr;
   }
 
+  // Drops the items without freeing them, for when the pool is reset as a whole.
+  void Forget() {
+    count = capacity = 0;
+    items = nullptr;
+  }
+
   void resize(size_t new_size) {
-    if (capacity < new_size) {
-      int size_class = new_size <= 1 ? 0 : 32 - __builtin_clz((unsigned)new_size - 1);
-      char* new_items = VectorPool<T>::Allocate(size_class);
-      memcpy(new_items, items, count * sizeof(T));
-      if (capacity) VectorPool<T>::Deallocate(items, __builtin_ctz(capacity));
-      items = new_items;
-      capacity = 1 << size_class;
-    }
+    if (capacity < new_size) Reserve(new_size);
     memset(items + count * sizeof(T), 0, (new_size - count) * sizeof(T));
     count = new_size;
+  }
+
+  // Adds an item that the caller must overwrite: it isn't zero-filled.
+  void push_back_uninitialized() {
+    if (capacity == count) Reserve(size_t(count) + 1);
+    ++count;
+  }
+
+  // Moves the items in [pos, end) up by one; item `end` must not own anything.
+  void ShiftUp(size_t pos, size_t end) {
+    for (size_t i = end; i > pos; --i)
+      memcpy(items + i * sizeof(T), items + (i - 1) * sizeof(T), sizeof(T));
   }
 
   size_t size() const { return count; }
@@ -836,6 +892,20 @@ class Vector {
   void pop_back() {
     back().~T();
     --count;
+  }
+
+  void Reserve(size_t new_size) {
+    int size_class = new_size <= 1 ? 0 : 32 - __builtin_clz((unsigned)new_size - 1);
+    char* new_items = VectorPool<T>::Allocate(size_class);
+    // Most vectors are short: copy item by item rather than call memcpy().
+    if (count <= 8)
+      for (size_t i = 0; i < count; ++i)
+        memcpy(new_items + i * sizeof(T), items + i * sizeof(T), sizeof(T));
+    else
+      memcpy(new_items, items, count * sizeof(T));
+    if (capacity) VectorPool<T>::Deallocate(items, __builtin_ctz(capacity));
+    items = new_items;
+    capacity = 1 << size_class;
   }
 
   void swap(Vector<T>& v) {
@@ -955,8 +1025,8 @@ struct Pattern {
     if (!sorted) Sort(new_pattern.patterns);
     // Shift the kept patterns one slot back and put the new pattern at pos.
     // Slot kept owns nothing, so memmove is safe like the relocation in Vector::resize().
-    if (kept == n) patterns.resize(n + 1);
-    memmove((void*)&patterns[pos + 1], (void*)&patterns[pos], (kept - pos) * sizeof(Pattern));
+    if (kept == n) patterns.push_back_uninitialized();
+    patterns.ShiftUp(pos, kept);
     patterns[pos].MoveFrom(new_pattern);
     while (patterns.size() > kept + 1) patterns.pop_back();
   }
@@ -968,7 +1038,7 @@ struct Pattern {
   }
 
   static void Append(Vector<Pattern>& patterns, Pattern& new_pattern) {
-    patterns.resize(patterns.size() + 1);
+    patterns.push_back_uninitialized();
     patterns.back().MoveFrom(new_pattern);
   }
 
@@ -1000,7 +1070,8 @@ struct Pattern {
   }
 };
 
-struct ShapeEntry {
+// A cache line each, so that a lookup reads one line: the hash and the seat's patterns.
+struct alignas(64) ShapeEntry {
   uint64_t hash;
   Vector<Pattern> patterns[NUM_SEATS];
 #ifdef _DEBUG
@@ -1028,9 +1099,11 @@ struct ShapeEntry {
     return total;
   }
 
+  // Only for an empty entry or when every entry is reset: ClearCaches() then takes back the
+  // patterns of all entries at once.
   void Reset(uint64_t hash_in) {
     hash = hash_in;
-    for (int s = 0; s < NUM_SEATS; ++s) patterns[s].clear();
+    for (int s = 0; s < NUM_SEATS; ++s) patterns[s].Forget();
 #ifdef _DEBUG
     shape = Shape();
 #endif
@@ -1044,6 +1117,8 @@ struct ShapeEntry {
 #endif
   }
 };
+
+static_assert(sizeof(ShapeEntry) == 64 && alignof(ShapeEntry) == 64, "one cache line");
 
 struct CutoffEntry {
   // Using 32-bit instead of 64-bit hash is safe because cut-off cards are
@@ -1230,7 +1305,7 @@ class Play {
 
     if (remaining_tricks == 1) return CollectLastTrick();
 
-    trick->all_cards = hands.all_cards();
+    ComputeAllCards();
     ComputeShape();
     trick->ComputeRelativeHands(hands);
 
@@ -1432,7 +1507,7 @@ class Play {
     const int remaining_tricks = hands.num_tricks();
     if (ns_tricks_won >= beta) return ns_tricks_won;
     if (ns_tricks_won + remaining_tricks < beta) return ns_tricks_won + remaining_tricks;
-    trick->all_cards = hands.all_cards();
+    ComputeAllCards();
     ComputeShape();
     trick->ComputeRelativeHands(hands);
     if (auto* shape_entry =
@@ -1581,7 +1656,7 @@ class Play {
       VERBOSE(printf("%2d: search cut @1 %s\n", depth, NameOf(card)));
       // One card that works is enough: only its own play relies on equivalence runs.
       equivalence_runs = NextRuns<POS>();
-      return {ns_tricks, rank_winners};
+      return {ns_tricks, LiftRunWinner(card, rank_winners)};
     }
     // The equivalence runs a failure of every card relies on.
     Cards runs = NextRuns<POS>();
@@ -1630,7 +1705,7 @@ class Play {
           VERBOSE(printf("%2d: search cut @%d %s\n", depth, i + 1, NameOf(card)));
           // One card that works is enough: only its own play relies on equivalence runs.
           equivalence_runs = NextRuns<POS>();
-          return {ns_tricks, branch_rank_winners};
+          return {ns_tricks, LiftRunWinner(card, branch_rank_winners)};
         }
         runs.Add(NextRuns<POS>());
         rank_winners.Add(branch_rank_winners);
@@ -1640,6 +1715,29 @@ class Play {
     }
     equivalence_runs = runs;
     return {ns_tricks, rank_winners};
+  }
+
+  // At a cut, the card played could as well have been the top card of the run of equivalent
+  // cards it belongs to: the play after it is the same with the run's cards one place lower.
+  // If the card won the trick as the lowest rank winner of its suit and that other proof has
+  // higher rank winners, returns them.
+  Cards LiftRunWinner(int card, Cards rank_winners) const {
+    if (!rank_winners.Include(card)) return rank_winners;
+    int suit = SuitOf(card);
+    if (rank_winners.Suit(suit).Bottom() != card) return rank_winners;
+    Cards suit_cards = trick->all_cards.Suit(suit);
+    Cards higher = suit_cards.Slice(suit * SUIT_SPAN, card);
+    Cards others = higher.Different(hands[seat_to_play]);
+    Cards run_above = others ? higher.Slice(others.Bottom() + 1, card) : higher;
+    // No run, or its card just above this one would move onto it: nothing to gain.
+    if (!run_above || rank_winners.Include(run_above.Bottom())) return rank_winners;
+    Cards shifted;
+    shifted.Add(run_above.Top());
+    for (int c : rank_winners.Intersect(run_above))
+      shifted.Add(suit_cards.Slice(c + 1, CARD_END).Top());
+    rank_winners.Remove(run_above);
+    rank_winners.Remove(card);
+    return rank_winners.Union(shifted);
   }
 
   template <bool SUIT_CONTRACT>
@@ -1863,14 +1961,30 @@ class Play {
     char ordered_cards[TOTAL_TRICKS];
   };
 
+  // The cards in play at a trick start: those of the previous trick start less its four cards
+  // (reading all four hands right after a card was put back stalls on store forwarding).
+  void ComputeAllCards() const {
+    if (depth == 0) {
+      trick->all_cards = hands.all_cards();
+    } else {
+      Cards cards = (trick - 1)->all_cards;
+      cards.Remove((this - 4)->card_played);
+      cards.Remove((this - 3)->card_played);
+      cards.Remove((this - 2)->card_played);
+      cards.Remove((this - 1)->card_played);
+      trick->all_cards = cards;
+      CHECK(trick->all_cards == hands.all_cards());
+    }
+  }
+
   void ComputeShape() const {
     if (depth == 0) {
       trick->shape = Shape(hands);
     } else {
-      trick->shape = (trick - 1)->shape;
-      trick->shape.PlayCards(plays[depth - 4].seat_to_play, plays[depth - 4].card_played,
-                             plays[depth - 3].card_played, plays[depth - 2].card_played,
-                             plays[depth - 1].card_played);
+      Shape shape = (trick - 1)->shape;
+      shape.PlayCards((this - 4)->seat_to_play, (this - 4)->card_played, (this - 3)->card_played,
+                      (this - 2)->card_played, (this - 1)->card_played);
+      trick->shape = shape;
       CHECK(trick->shape == Shape(hands));
     }
   }
@@ -1907,11 +2021,13 @@ class Play {
     hands[seat_to_play].Remove(card_played);
 
     // who's winning?
-    if (At<POS>(0)) trick->lead_suit = SuitOf(card_played);
-    if (At<POS>(0) || WinOver(card_played, PreviousPlay().WinningCard())) {
-      winning_play = depth;
+    if (At<POS>(0)) trick->lead_suit = SuitOf(card_to_play);
+    if (At<POS>(0) || WinOver(card_to_play, PreviousPlay().winning_card)) {
+      winning_card = card_to_play;
+      winning_seat = seat_to_play;
     } else {
-      winning_play = PreviousPlay().winning_play;
+      winning_card = PreviousPlay().winning_card;
+      winning_seat = PreviousPlay().winning_seat;
     }
   }
 
@@ -2368,9 +2484,12 @@ class Play {
 
   Cards GetTrickRankWinner() const {
     CHECK(TrickEnding());
-    int winning_card = WinningCard();
-    auto played_cards = trick->all_cards.Different(hands.all_cards());
-    return played_cards.Suit(SuitOf(winning_card)).Size() > 1 ? Cards().Add(winning_card) : Cards();
+    // The winner is a rank winner if another card of its suit was played to the trick.
+    int winning_card = WinningCard(), suit = SuitOf(winning_card);
+    int same_suit = (SuitOf((this - 3)->card_played) == suit) +
+                    (SuitOf((this - 2)->card_played) == suit) +
+                    (SuitOf((this - 1)->card_played) == suit) + (SuitOf(card_played) == suit);
+    return same_suit > 1 ? Cards().Add(winning_card) : Cards();
   }
 
   // Given fast tricks that cut needing only `need` of them, looks for the same cut with
@@ -2516,8 +2635,8 @@ class Play {
   bool WinOver(int c1, int c2) const {
     return SuitOf(c1) == SuitOf(c2) ? HigherRank(c1, c2) : SuitOf(c1) == trump;
   }
-  int WinningCard() const { return plays[winning_play].card_played; }
-  int WinningSeat() const { return plays[winning_play].seat_to_play; }
+  int WinningCard() const { return winning_card; }
+  int WinningSeat() const { return winning_seat; }
   int LeadSuit() const { return trick->lead_suit; }
   int NextSeat(int count = 1) const { return (seat_to_play + count) & (NUM_SEATS - 1); }
   int LeftHandOpp() const { return NextSeat(1); }
@@ -2548,7 +2667,8 @@ class Play {
   int ns_tricks_won = 0;
   int seat_to_play;
   int card_played;
-  int winning_play;
+  int winning_card;  // The card winning the trick so far, and the seat that played it.
+  int winning_seat;
   OrderedCards ordered_cards;
   // The equivalence runs this play's last result relies on within its trick; see
   // ComputePatternCards().
@@ -2753,6 +2873,7 @@ thread_local bool cached_discard_suit_bottom = false;
 
 void ClearCaches() {
   common_bounds_cache.Reset();
+  VectorPool<Pattern>::Reset();
   cutoff_cache.Reset();
   cached_trump = -1;
 }
