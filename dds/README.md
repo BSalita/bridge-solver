@@ -77,5 +77,17 @@ It exits non-zero on any mismatch beyond the differences above. ddss's own
 `dtest --random-deals 1000 --verify --oob-dll build/dds-single.dll` cross-checks
 tables.
 
+## Checking it against stored solves
+
+    python dds/test/verify_parquet.py [FILE.parquet ...] [--limit N] [--restart]
+
+solves every distinct deal of parquet files that hold a `PBN` column and
+mlBridge's 20 `DD_{N,E,S,W}_{S,H,D,C,N}` columns (by default the ACBL club and
+tournament hand records) and compares all 20 results with the stored ones, on
+every core. It prints a progress line every 10,000 deals, stops at the first
+mismatch (asking classic DDS, when it is found, which side is right) and can be
+stopped and run again: it continues from its checkpoint. Its docstring has the
+details.
+
 `train.cc` with `train-deals.txt` is part of the PGO training run (tables and
 every opening lead of 60 random deals).
