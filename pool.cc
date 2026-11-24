@@ -2,6 +2,7 @@
 // SolveTables() (see solver.h). The solver's search caches are thread_local,
 // so each pool thread searches with caches of its own, and the threads live
 // as long as the library so the caches keep the size they grew to.
+// ReleaseAllCaches() (solver.cc) frees them, with every other thread's.
 #include <string.h>
 
 #include <algorithm>
@@ -170,11 +171,4 @@ void SolveTables(
         [&](int trump, int lead_seat, int ns_tricks) { seat_done(d, trump, lead_seat, ns_tricks); },
         [](int) {});
   });
-}
-
-void ReleaseAllCaches() {
-  ReleaseCaches();
-  std::lock_guard<std::mutex> run(run_mutex);
-  std::lock_guard<std::mutex> lock(config_mutex);
-  if (pool) pool->Run(ReleaseCaches);
 }

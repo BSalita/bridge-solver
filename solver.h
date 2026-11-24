@@ -128,6 +128,7 @@ BS_API bool SolvePlayAtLeast(const Deal& deal, int trump, int lead_seat,
 
 // Frees the calling thread's search caches; the next search makes new ones.
 // The caches are per thread, so a library can run searches on many threads.
+// A thread's caches are also freed when it exits.
 BS_API void ReleaseCaches();
 
 // Every card the seat to play after `played_cards` may play, not just one of
@@ -202,7 +203,9 @@ BS_API void SolveTables(
     const std::vector<Deal>& deals, const std::vector<int>& trumps,
     const std::function<void(int deal, int trump, int lead_seat, int ns_tricks)>& seat_done);
 
-// ReleaseCaches() on the calling thread and on every pool thread.
+// Frees the search caches of every thread that has searched: the calling
+// thread, the pool's threads and any other thread that called the library.
+// A thread searching meanwhile frees its caches when that search returns.
 BS_API void ReleaseAllCaches();
 
 #endif  // SOLVER_H
