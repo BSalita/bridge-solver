@@ -12,8 +12,10 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <vector>
 
@@ -753,47 +755,48 @@ struct Bounds {
 // by a growing vector are reused through one LIFO list per power-of-two
 // capacity. Reset() forgets every block at once: the next blocks are carved
 // from the first chunk again, which is the memory used most recently. Chunks
-// are never freed.
+// are freed only by Release(), through ReleaseCaches(), ReleaseAllCaches() or
+// the exit of the thread.
 template <class T>
 class VectorPool {
  public:
   static char* Allocate(int size_class) {
-    STATS(++alloc_calls[size_class]);
-    char*& head = free_lists[size_class];
+    STATS(++state.alloc_calls[size_class]);
+    char*& head = state.free_lists[size_class];
     if (head) {
       char* block = head;
       head = *reinterpret_cast<char**>(block);
       return block;
     }
-    STATS(++miss_calls[size_class]);
+    STATS(++state.miss_calls[size_class]);
     return Carve(size_class);
   }
 
   static void Deallocate(char* block, int size_class) {
-    char*& head = free_lists[size_class];
+    char*& head = state.free_lists[size_class];
     *reinterpret_cast<char**>(block) = head;
     head = block;
   }
 
   // Takes back every block; no vector allocated here may be used afterwards.
   static void Reset() {
-    for (auto& head : free_lists) head = nullptr;
-    current_chunk = nullptr;
-    cursor = limit = nullptr;
-    for (LargeBlock* large = large_blocks; large; large = large->next)
+    for (auto& head : state.free_lists) head = nullptr;
+    state.current_chunk = nullptr;
+    state.cursor = state.limit = nullptr;
+    for (LargeBlock* large = state.large_blocks; large; large = large->next)
       Deallocate(reinterpret_cast<char*>(large + 1), large->size_class);
   }
 
   static void ShowStatistics() {
     printf("--- VectorPool<T> Statistics (block = %zu bytes) ---\n", sizeof(T));
     uint64_t total_allocs = 0;
-    for (int i = 0; i < 16; ++i) total_allocs += alloc_calls[i];
+    for (int i = 0; i < 16; ++i) total_allocs += state.alloc_calls[i];
     for (int i = 0; i < 16; ++i) {
-      if (!alloc_calls[i]) continue;
+      if (!state.alloc_calls[i]) continue;
       printf("class %2d (cap %6zu): allocs %10" PRIu64 " (%5.2f%%)   misses %8" PRIu64
              " (%6.2f%% of allocs)\n",
-             i, size_t{1} << i, alloc_calls[i], alloc_calls[i] * 100.0 / total_allocs,
-             miss_calls[i], miss_calls[i] * 100.0 / alloc_calls[i]);
+             i, size_t{1} << i, state.alloc_calls[i], state.alloc_calls[i] * 100.0 / total_allocs,
+             state.miss_calls[i], state.miss_calls[i] * 100.0 / state.alloc_calls[i]);
     }
   }
 
@@ -813,34 +816,66 @@ class VectorPool {
     size_t block_bytes = (size_t{1} << size_class) * sizeof(T);
     if (block_bytes > CHUNK_SIZE / 4) {
       auto* large = reinterpret_cast<LargeBlock*>(new char[sizeof(LargeBlock) + block_bytes]);
-      large->next = large_blocks;
+      large->next = state.large_blocks;
       large->size_class = size_class;
-      large_blocks = large;
+      state.large_blocks = large;
       return reinterpret_cast<char*>(large + 1);
     }
-    if (size_t(limit - cursor) < block_bytes) {
-      Chunk*& next = current_chunk ? current_chunk->next : first_chunk;
+    if (size_t(state.limit - state.cursor) < block_bytes) {
+      Chunk*& next = state.current_chunk ? state.current_chunk->next : state.first_chunk;
       if (!next) {
         next = reinterpret_cast<Chunk*>(new char[CHUNK_SIZE]);
         next->next = nullptr;
       }
-      current_chunk = next;
-      cursor = reinterpret_cast<char*>(current_chunk + 1);
-      limit = reinterpret_cast<char*>(current_chunk) + CHUNK_SIZE;
+      state.current_chunk = next;
+      state.cursor = reinterpret_cast<char*>(state.current_chunk + 1);
+      state.limit = reinterpret_cast<char*>(state.current_chunk) + CHUNK_SIZE;
     }
-    char* block = cursor;
-    cursor += block_bytes;
+    char* block = state.cursor;
+    state.cursor += block_bytes;
     return block;
   }
 
-  static inline thread_local uint64_t alloc_calls[16] = {};
-  static inline thread_local uint64_t miss_calls[16] = {};
-  static inline thread_local char* free_lists[16] = {};
-  static inline thread_local Chunk* first_chunk = nullptr;
-  static inline thread_local Chunk* current_chunk = nullptr;
-  static inline thread_local char* cursor = nullptr;
-  static inline thread_local char* limit = nullptr;
-  static inline thread_local LargeBlock* large_blocks = nullptr;
+ public:
+  // A thread's pool. Each thread has its own, and ThreadPool() gives it to
+  // other threads, so that ReleaseAllCaches() can free the pool of a thread
+  // that is not searching.
+  struct State {
+    uint64_t alloc_calls[16];
+    uint64_t miss_calls[16];
+    char* free_lists[16];
+    Chunk* first_chunk;
+    Chunk* current_chunk;
+    char* cursor;
+    char* limit;
+    LargeBlock* large_blocks;
+  };
+
+  static State& ThreadPool() { return state; }
+
+  // Frees every chunk and large block of a pool, which the thread that owns
+  // it must not be using: no vector allocated from it may be used afterwards.
+  static void Release(State& pool) {
+    for (Chunk* chunk = pool.first_chunk; chunk;) {
+      Chunk* next = chunk->next;
+      delete[] reinterpret_cast<char*>(chunk);
+      chunk = next;
+    }
+    for (LargeBlock* large = pool.large_blocks; large;) {
+      LargeBlock* next = large->next;
+      delete[] reinterpret_cast<char*>(large);
+      large = next;
+    }
+    for (auto& head : pool.free_lists) head = nullptr;
+    pool.first_chunk = pool.current_chunk = nullptr;
+    pool.cursor = pool.limit = nullptr;
+    pool.large_blocks = nullptr;
+  }
+
+ private:
+  // Constant-initialized and trivially destructible, so reaching it costs no
+  // initialization check; the thread's ThreadCaches frees it when it exits.
+  static inline thread_local State state = {};
 };
 
 template <class T>
@@ -2855,11 +2890,143 @@ void ClearCaches() {
   cached_trump = -1;
 }
 
-void ReleaseCaches() {
-  common_bounds_cache.Release();
-  cutoff_cache.Release();
-  cached_trump = -1;
-}
+// A thread's search caches, reachable from other threads so that
+// ReleaseAllCaches() can free the caches of every thread that has searched,
+// not only its own and the pool's. Freed when the thread exits: a caller's
+// threads come and go (a .NET or Java thread pool retires idle threads), and
+// the caches of a thread that is gone can't be reached any other way.
+//
+// The caches themselves stay plain constant-initialized thread_locals, as a
+// destructor would add an initialization check to every access in the search.
+// This one is reached once per search, through CacheUse.
+class ThreadCaches {
+ public:
+  ThreadCaches() = default;
+  ThreadCaches(const ThreadCaches&) = delete;
+  ThreadCaches& operator=(const ThreadCaches&) = delete;
+
+  ~ThreadCaches() {
+    if (!registered_) return;
+    {
+      std::lock_guard<std::mutex> lock(RegistryMutex());
+      if (prev_) prev_->next_ = next_;
+      else head_ = next_;
+      if (next_) next_->prev_ = prev_;
+    }
+    // Unlinked, so no other thread can reach it.
+    FreeAll();
+  }
+
+  // The calling thread's, registered on its first use.
+  static ThreadCaches& Mine() {
+    static thread_local ThreadCaches mine;
+    if (!mine.registered_) mine.Register();
+    return mine;
+  }
+
+  // Frees the calling thread's caches, or when it is searching (a callback
+  // during Solve(), say) once the search is done.
+  void ReleaseOwn() {
+    if (depth_ > 0) {
+      release_pending_.store(true, std::memory_order_relaxed);
+      return;
+    }
+    std::lock_guard<std::recursive_mutex> lock(in_use_);
+    FreeAll();
+  }
+
+  // Frees the caches of every thread that has searched. A thread searching
+  // now frees its own when its search returns.
+  static void ReleaseEveryThread() {
+    ThreadCaches& mine = Mine();
+    std::lock_guard<std::mutex> lock(RegistryMutex());
+    for (ThreadCaches* t = head_; t; t = t->next_) {
+      if (t == &mine) {
+        mine.ReleaseOwn();
+      } else if (t->in_use_.try_lock()) {
+        t->FreeAll();
+        t->in_use_.unlock();
+      } else {
+        t->release_pending_.store(true, std::memory_order_relaxed);
+      }
+    }
+  }
+
+  // Marks the thread as searching for as long as a CacheUse lives.
+  void Enter() {
+    if (depth_++ == 0) {
+      in_use_.lock();
+      // Asked for while the thread was last searching, or just after.
+      if (release_pending_.exchange(false, std::memory_order_relaxed)) FreeAll();
+    }
+  }
+  void Leave() {
+    if (--depth_ == 0) {
+      if (release_pending_.exchange(false, std::memory_order_relaxed)) FreeAll();
+      in_use_.unlock();
+    }
+  }
+
+ private:
+  // A mutex that is never destroyed: threads may still exit, and unregister,
+  // after static destructors have run at process exit.
+  static std::mutex& RegistryMutex() {
+    static std::mutex* mutex = new std::mutex;
+    return *mutex;
+  }
+
+  void Register() {
+    bounds_ = &common_bounds_cache;
+    cutoff_ = &cutoff_cache;
+    pool_ = &VectorPool<Pattern>::ThreadPool();
+    trump_ = &cached_trump;
+    std::lock_guard<std::mutex> lock(RegistryMutex());
+    next_ = head_;
+    if (head_) head_->prev_ = this;
+    head_ = this;
+    registered_ = true;
+  }
+
+  // Only by the owning thread, or with in_use_ held by another, so that the
+  // owner isn't searching. The patterns all live in the pool: forgetting them
+  // first leaves nothing for the table's destructors to give back to it.
+  void FreeAll() {
+    bounds_->Reset();
+    bounds_->Release();
+    cutoff_->Release();
+    VectorPool<Pattern>::Release(*pool_);
+    *trump_ = -1;
+  }
+
+  static inline ThreadCaches* head_ = nullptr;  // guarded by RegistryMutex()
+  ThreadCaches* prev_ = nullptr;                // guarded by RegistryMutex()
+  ThreadCaches* next_ = nullptr;                // guarded by RegistryMutex()
+  bool registered_ = false;                     // owner only
+  int depth_ = 0;                               // owner only: CacheUse nesting
+  std::recursive_mutex in_use_;                 // held while the thread searches
+  std::atomic<bool> release_pending_{false};
+  Cache<ShapeEntry>* bounds_ = nullptr;
+  Cache<CutoffEntry>* cutoff_ = nullptr;
+  VectorPool<Pattern>::State* pool_ = nullptr;
+  int* trump_ = nullptr;
+};
+
+// Held for the length of a search that uses the caches, so that
+// ReleaseAllCaches() on another thread leaves them alone meanwhile.
+class CacheUse {
+ public:
+  CacheUse() : caches_(ThreadCaches::Mine()) { caches_.Enter(); }
+  ~CacheUse() { caches_.Leave(); }
+  CacheUse(const CacheUse&) = delete;
+  CacheUse& operator=(const CacheUse&) = delete;
+
+ private:
+  ThreadCaches& caches_;
+};
+
+void ReleaseCaches() { ThreadCaches::Mine().ReleaseOwn(); }
+
+void ReleaseAllCaches() { ThreadCaches::ReleaseEveryThread(); }
 
 // Keeps the caches while searches stay on the same deal, trump and discard
 // setting, and clears them otherwise. Empty caches aren't cleared again: the
@@ -2881,6 +3048,7 @@ void Solve(const Deal& deal, const std::vector<int>& trumps, const std::vector<i
            const std::function<void(int trump)>& trump_start,
            const std::function<void(int trump, int lead_seat, int ns_tricks)>& seat_done,
            const std::function<void(int trump)>& trump_done) {
+  CacheUse use;
   Hands hands = ToHands(deal);
   int num_tricks = hands[WEST].Size();
   for (int trump : trumps) {
@@ -3012,6 +3180,7 @@ Position GetPosition(const Deal& deal, int trump, int lead_seat,
 
 int SolvePlay(const Deal& deal, int trump, int lead_seat, const std::vector<int>& played_cards,
               int guess_ns_tricks) {
+  CacheUse use;
   Hands hands = ToHands(deal);
   assert(!played_cards.empty() && played_cards.size() <= size_t(4 * hands.num_tricks()));
   UseCaches(hands, trump);
@@ -3024,6 +3193,7 @@ int SolvePlay(const Deal& deal, int trump, int lead_seat, const std::vector<int>
 std::vector<int> SolvePlays(const Deal& deal, int trump, int lead_seat,
                             const std::vector<int>& played_cards, const std::vector<int>& cards,
                             int guess_ns_tricks) {
+  CacheUse use;
   Hands hands = ToHands(deal);
   assert(played_cards.size() < size_t(4 * hands.num_tricks()));
   UseCaches(hands, trump);
@@ -3043,6 +3213,7 @@ bool SolvePlayAtLeast(const Deal& deal, int trump, int lead_seat,
   assert(played_cards.size() < size_t(4 * hands.num_tricks()));
   if (ns_tricks <= 0) return true;
   if (ns_tricks > hands.num_tricks()) return false;
+  CacheUse use;
   UseCaches(hands, trump);
   return PlaySequence(hands, trump, lead_seat, played_cards).SolvePlayAtLeast(card, ns_tricks);
 }
@@ -3076,6 +3247,7 @@ bool ClaimLayoutAtLeast(const uint64_t unplayed[NUM_SEATS], int trump, int lead_
   for (int i = 0; i < played; ++i) hands[(lead_seat + i) % NUM_SEATS].Add(trick[i]);
   if (ns_tricks <= 0) return true;
   if (ns_tricks > hands.num_tricks()) return false;
+  CacheUse use;
   common_bounds_cache.Ensure();
   cutoff_cache.Ensure();
   if (fresh || trump != cached_trump || options.discard_suit_bottom != cached_discard_suit_bottom)
