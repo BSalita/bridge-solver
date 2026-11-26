@@ -594,6 +594,21 @@ class RelativeHands {
   uint64_t low, high, cards;
 };
 
+// Releases a thread's caches (ReleaseCaches()) when the thread ends. The
+// caches are constant-initialised thread_locals without destructors, so that
+// searches reach them without a TLS guard; this object carries the destructor
+// instead, and only Cache::Ensure() touches it, when it allocates. Without it
+// every thread that searched and then ended left its caches behind, which
+// leaks steadily under callers that start threads of their own for each batch
+// of searches (PIMC's evaluations in BEN: about 0.5 GB a board).
+struct ThreadCacheOwner {
+  bool used = false;
+  ~ThreadCacheOwner() {
+    if (used) ReleaseCaches();
+  }
+};
+static thread_local ThreadCacheOwner thread_cache_owner;
+
 template <class Entry>
 class Cache {
  public:
@@ -605,7 +620,12 @@ class Cache {
 
   // Allocates the table on a thread's first search.
   void Ensure() {
-    if (entries) return;
+    if (!entries) Allocate();
+  }
+
+  // Ensure()'s first-search work, out of line so that callers stay as small as before.
+  __attribute__((noinline)) void Allocate() {
+    thread_cache_owner.used = true;
     entries = new Entry[size];
     used = new uint32_t[size];
     for (int i = 0; i < size; ++i) entries[i].Reset(0);
@@ -753,7 +773,12 @@ struct Bounds {
 // by a growing vector are reused through one LIFO list per power-of-two
 // capacity. Reset() forgets every block at once: the next blocks are carved
 // from the first chunk again, which is the memory used most recently. Chunks
-// are never freed.
+// are freed only by Release(), with the rest of the thread's caches.
+//
+// The thread-local state of this file has internal linkage: exported, it
+// would be bound across two copies of the library loaded in one process, so
+// that one copy's searches used the other copy's pool.
+namespace {
 template <class T>
 class VectorPool {
  public:
@@ -782,6 +807,26 @@ class VectorPool {
     cursor = limit = nullptr;
     for (LargeBlock* large = large_blocks; large; large = large->next)
       Deallocate(reinterpret_cast<char*>(large + 1), large->size_class);
+  }
+
+  // Frees every chunk and large block of the calling thread. No vector
+  // allocated here may be used or freed afterwards: release the caches that
+  // hold such vectors first.
+  static void Release() {
+    for (Chunk* chunk = first_chunk; chunk;) {
+      Chunk* next = chunk->next;
+      delete[] reinterpret_cast<char*>(chunk);
+      chunk = next;
+    }
+    for (LargeBlock* large = large_blocks; large;) {
+      LargeBlock* next = large->next;
+      delete[] reinterpret_cast<char*>(large);
+      large = next;
+    }
+    for (auto& head : free_lists) head = nullptr;
+    first_chunk = current_chunk = nullptr;
+    large_blocks = nullptr;
+    cursor = limit = nullptr;
   }
 
   static void ShowStatistics() {
@@ -842,6 +887,7 @@ class VectorPool {
   static inline thread_local char* limit = nullptr;
   static inline thread_local LargeBlock* large_blocks = nullptr;
 };
+}  // namespace
 
 template <class T>
 class Vector {
@@ -1145,8 +1191,8 @@ struct CutoffEntry {
 #else
 #define CONSTANT_INIT
 #endif
-CONSTANT_INIT thread_local Cache<ShapeEntry> common_bounds_cache("Common Bounds Cache", 13);
-CONSTANT_INIT thread_local Cache<CutoffEntry> cutoff_cache("Cut-off Cache", 16);
+CONSTANT_INIT static thread_local Cache<ShapeEntry> common_bounds_cache("Common Bounds Cache", 13);
+CONSTANT_INIT static thread_local Cache<CutoffEntry> cutoff_cache("Cut-off Cache", 16);
 
 struct Trick {
   Shape shape;
@@ -1242,7 +1288,8 @@ struct Stat {
              depth, num_visits, double(num_branches) / num_visits, num_cutoff_collisions, num_cuts,
              num_cached_cuts, num_new_cuts, num_missed_cuts);
   }
-} thread_local stats[TOTAL_CARDS];
+};
+static thread_local Stat stats[TOTAL_CARDS];
 
 class Play {
  public:
@@ -2844,9 +2891,9 @@ void ShowDetailed(const Deal& deal, int rotation) { ToHands(deal).ShowDetailed(r
 
 // The deal, trump and discard setting the caches hold entries for; no trump
 // (-1) when they hold none.
-thread_local Hands cached_hands;
-thread_local int cached_trump = -1;
-thread_local bool cached_discard_suit_bottom = false;
+static thread_local Hands cached_hands;
+static thread_local int cached_trump = -1;
+static thread_local bool cached_discard_suit_bottom = false;
 
 void ClearCaches() {
   common_bounds_cache.Reset();
@@ -2856,8 +2903,10 @@ void ClearCaches() {
 }
 
 void ReleaseCaches() {
+  // The cache entries' vectors go back to the pool before its chunks are freed.
   common_bounds_cache.Release();
   cutoff_cache.Release();
+  VectorPool<Pattern>::Release();
   cached_trump = -1;
 }
 
